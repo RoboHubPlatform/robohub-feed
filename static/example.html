@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<!--
+  @file example.html
+  @brief How a RoboHub feed is embedded: widget.js and one <robohub-widget> per reading.
+
+  @module feed.widget
+  @project robohub-feed
+  @author Aurel Miron
+  @date 2026-11-20
+
+  SPDX-License-Identifier: MIT
+
+  Published beside widget.js by a directory publisher. It names no feed, so it
+  cannot lead from one feed to another: open it as example.html#<feed id> to see
+  that feed's snapshot (feeds/<id>.json) drawn every way the widget draws it.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>RoboHub feed — example</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 52rem; margin: 2rem auto; padding: 0 1rem; }
+  .row { display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-start; margin: 1rem 0; }
+  code, pre { background: rgba(127, 127, 127, .12); border-radius: 4px; padding: .1em .3em; }
+  pre { padding: .7em 1em; overflow-x: auto; }
+  @media (prefers-color-scheme: dark) { body { background: #0f1317; color: #e6eaee; } }
+</style>
+<script src="widget.js" defer></script>
+</head>
+<body>
+<h1>RoboHub feed</h1>
+<p id="hint">Open this page as <code>example.html#&lt;feed id&gt;</code>.</p>
+<div class="row" id="widgets"></div>
+<h2>Embedding</h2>
+<pre>&lt;script src="https://YOUR-HOST/widget.js" defer&gt;&lt;/script&gt;
+&lt;robohub-widget src="https://YOUR-HOST/feeds/FEED-ID.json" kind="table"&gt;&lt;/robohub-widget&gt;
+&lt;robohub-widget src="https://YOUR-HOST/feeds/FEED-ID.json" item="i1" kind="number"&gt;&lt;/robohub-widget&gt;
+&lt;robohub-widget src="https://YOUR-HOST/feeds/FEED-ID.json" item="i1" kind="chart"&gt;&lt;/robohub-widget&gt;</pre>
+<script>
+  (function () {
+    var id = location.hash.replace(/^#/, "");
+    if (!/^[0-9a-f]{16,64}$/.test(id)) {
+      return;
+    }
+    document.getElementById("hint").textContent = "feeds/" + id + ".json";
+    var row = document.getElementById("widgets");
+    [["", "table"], ["i1", "number"], ["i1", "chart"]].forEach(function (pair) {
+      var widget = document.createElement("robohub-widget");
+      widget.setAttribute("src", "feeds/" + id + ".json");
+      if (pair[0]) {
+        widget.setAttribute("item", pair[0]);
+      }
+      widget.setAttribute("kind", pair[1]);
+      row.appendChild(widget);
+    });
+  })();
+</script>
+</body>
+</html>

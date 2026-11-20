@@ -1,0 +1,100 @@
+#
+# robohub-feed — chosen readings of a RoboHub installation, published outward
+# as static snapshots and a small widget script for other sites (robohub
+# ADR-0019).
+#
+# One HTTP service on loopback. It keeps feeds — explicit selections of
+# readings — reads each item from the application that holds it (Mesh, or an
+# application's appapi) with a read-only service token, and hands one JSON
+# snapshot per feed and a dependency-free widget.js to the feed's publishers.
+# Nothing outside the machine ever reaches it: pages of other sites read only
+# the files a publisher put somewhere.
+#
+module:
+  # The keeper knows an application, its grants (`feed:*`, `feed:read`) and the
+  # audience of its sign-in by this name; the repository is robohub-feed.
+  name: feed
+  id: robohub.app.feed
+  type: rho
+  version: 0.1.0
+  kind: keeper-hosted
+  title: Feed
+  description: >
+    Publishes chosen readings of the installation — from Mesh, Aquarium, Energy —
+    as static JSON snapshots and a dependency-free widget script, so pages of
+    other sites can show them without reaching the installation.
+  route: /
+  port: "8484"
+  command: feed
+  maintainer: "Aurel Miron"
+  license: "MIT"
+  created: "2026-11-20"
+
+platform: robohub
+
+# Requirements: the prefix of the ids this module allocates, and the repository
+# that holds levels.yml and the system level (rho req).
+requirements:
+  prefix: FEED
+  parent: robohub
+
+main: src/main.rho
+
+build:
+  language: go
+  targets:
+    - go-server
+
+# How a person signs in: the keeper's ticket, as every RoboHub application.
+plugins:
+  - name: robohub-auth
+    enabled: true
+    config:
+      issuer: keeper
+      mode: direct
+      login_url: "http://127.0.0.1:19090/auth/login"
+
+# The feeds themselves are a text file in the workspace (ADR-0001); the only
+# database is the notifications module's, which keeps the toasts a page shows.
+requires:
+  - name: rho/sqlite
+
+sql:
+  driver: rho-sql-sqlite
+  schema: db/schema.sql
+  out: src/db
+
+deps:
+  rho-log: ">=0.1.2"
+  rho-sql: ">=0.2.0"
+  robohub:
+    ui: ">=0.2.0"
+    i18n: ">=0.4.0"
+    settings: ">=0.2.0"
+    forms: ">=0.3.7"
+    notifications: ">=0.3.0"
+    logging: ">=0.2.0"
+    robohub-auth: ">=0.1.0"
+
+deploy:
+  port: 8484
+  service: feed
+  # The applications it reads from; the keeper registers it as a client for
+  # these alone, and it asks each for a read-only scope (FEED-0002).
+  calls: [mesh, aquarium, energy]
+
+docs:
+  title: Feed
+  section: applications
+  order: "47"
+  index: docs/doc/index.md
+  sources:
+    - docs/doc/index.md
+
+# What the application reads at run time by name: its own manifest (the
+# applications it may call), its guide, and the files it publishes.
+assets:
+  - module.yml
+  - docs/doc/index.md
+  - static/widget.js
+  - static/example.html

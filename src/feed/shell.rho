@@ -1,0 +1,137 @@
+//
+// @file shell.rho
+// @brief Feed's part of the RoboHub shell: the top bar, the rail, the layout, and who may do what.
+//
+// @module feed
+// @project robohub-feed
+// @author Aurel Miron
+// @date 2026-11-20
+//
+// SPDX-License-Identifier: MIT
+//
+
+module feed
+
+// Every page has the RoboHub top bar (the keeper's application switcher, the
+// person signed in, language and theme), a rail of Feed's places and the look of
+// robohub.ui — the same shell Aquarium and Energy draw through appshell. Feed
+// draws it with robohub.ui directly: appshell's top bar shows a gateway and a
+// rules mode, and carries the rules, the journal and the gateway interface with
+// it, none of which Feed has.
+
+fn host_app() string {
+    return "feed"
+}
+
+fn host_app_title() string {
+    return "Feed"
+}
+
+// feed_may is whether the request may look (`write` false) or change (`write`
+// true), from the grants in its verified ticket (FEED-0007).
+// @req FEED-0007
+fn feed_may(req: Request, write: bool) bool {
+    return fa_grant(header_str(req, "X-Rho-Aud"), header_str(req, "X-Rho-Scopes"), write)
+}
+
+fn feed_rail_link(req: Request, href: string, icon: string, label: string, phone: bool) string {
+    let path: string = request_path(req)
+    var on: string = ""
+    if str_eq(path, href) || (!str_eq(href, "/") && str_starts_with(path, href)) {
+        on = " class=\"on\""
+    }
+    var on_phone: string = ""
+    if phone {
+        on_phone = " data-phone"
+    }
+    return "<a" + on + on_phone + " href=\"" + href + "\"><i>" + icon + "</i>" + escape_html(label) + "</a>"
+}
+
+fn feed_rail(req: Request) string {
+    return feed_rail_link(req, "/", "◉", i18n_t(req, "nav.feeds"), true) +
+        feed_rail_link(req, "/feeds/new", "+", i18n_t(req, "nav.new"), true) +
+        feed_rail_link(req, "/publishers", "⇪", i18n_t(req, "nav.publishers"), true) +
+        "<h6>" + i18n_t(req, "nav.group.system") + "</h6>" +
+        feed_rail_link(req, "/docs", "▧", i18n_t(req, "nav.docs"), false)
+}
+
+fn feed_topbar(req: Request) string {
+    let keeper_port: string = getenv("RHO_KEEPER_PORT")
+    var who: string = header_str(req, "X-Rho-Subject")
+    if who == "" {
+        who = i18n_t(req, "top.signed_in")
+    }
+    var signout: string = ""
+    if keeper_port != "" {
+        signout = "<a class=\"app-open\" href=\"#\" data-app-port=\"" + escape_html(keeper_port) +
+            "\" data-app-route=\"/logout\">" + i18n_t(req, "top.sign_out") + "</a>"
+    }
+    var middle: string = "<span class=\"app-chip\">" + escape_html(i18n_t(req, "top.outward")) + "</span>"
+    if !feed_may(req, true) {
+        middle = middle + "<span class=\"app-chip mode\">" + escape_html(i18n_t(req, "top.read_only")) + "</span>"
+    }
+    return ui_topbar_remote_in(host_app(), host_app_title(), keeper_port, middle,
+        ui_person(req, who, "", ui_language(i18n_locale(req), request_path(req)), signout, true), i18n_locale(req))
+}
+
+// feed_toast is the script that shows a message once the page has loaded.
+fn feed_toast(message: string) string {
+    if message == "" {
+        return ""
+    }
+    return "<script>document.addEventListener(\"DOMContentLoaded\",function(){if(window.rhoToast){window.rhoToast(" +
+        json_string(message) + ", \"info\");}});</script>"
+}
+
+// feed_page is a page of Feed's, inside the shell, with the message a redirect
+// carried (`?done=<key>` or `?error=<key>`) as a toast.
+fn feed_page(req: Request, status: u32, title: string, body: string) Response {
+    var message: string = ""
+    let done: string = request_query_param(req, "done")
+    let error: string = request_query_param(req, "error")
+    if feed_message_key(done) {
+        message = i18n_t(req, done)
+    } else if feed_message_key(error) {
+        message = i18n_t(req, error)
+    }
+    let document: string = template_fill(template_get("layout"),
+        vars("title", title) +
+        vars("theme", ui_theme(req)) +
+        vars("ui_head", ui_head()) +
+        i18n_vars(req) +
+        vars("topbar", feed_topbar(req)) +
+        vars("nav", feed_rail(req)) +
+        vars("body", body + feed_toast(message)) +
+        vars("notifications", notification_embed()) +
+        vars("forms_style", forms_style()))
+    return html(status, document)
+}
+
+// feed_message_key is whether a query value names one of Feed's messages, so a
+// link cannot put text of its own on the page.
+fn feed_message_key(key: string) bool {
+    if strlen(key) > 40 {
+        return false
+    }
+    return str_starts_with(key, "feed.") || str_starts_with(key, "item.") || str_starts_with(key, "publisher.")
+}
+
+fn feed_denied(req: Request) Response {
+    return feed_page(req, status_forbidden(), i18n_t(req, "access.title"),
+        "<section class=\"rh-card wide\"><h1>" + i18n_t(req, "access.title") + "</h1><p>" +
+        escape_html(i18n_t(req, "access.denied")) + "</p><p><a href=\"/\">" + i18n_t(req, "access.back") + "</a></p></section>")
+}
+
+fn feed_csrf_refused(req: Request) Response {
+    return feed_page(req, status_forbidden(), i18n_t(req, "form.expired_title"),
+        "<section class=\"rh-card wide\"><h1>" + i18n_t(req, "form.expired_title") + "</h1><p>" +
+        escape_html(i18n_t(req, "form.expired")) + "</p><p><a href=\"/\">" + i18n_t(req, "access.back") + "</a></p></section>")
+}
+
+// feed_when is a time as a page shows it: UTC, or "never".
+fn feed_when(req: Request, epoch: u32) string {
+    if epoch == 0 {
+        return i18n_t(req, "feed.never")
+    }
+    return str_replace(str_replace(fs_iso(epoch), "T", " "), "Z", " UTC")
+}

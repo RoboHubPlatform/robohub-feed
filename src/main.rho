@@ -1,0 +1,88 @@
+//
+// @file main.rho
+// @brief Feed: its modules, its routes, what it does at start and the refresh loop in the background.
+//
+// @module feed
+// @project robohub-feed
+// @author Aurel Miron
+// @date 2026-11-20
+//
+// SPDX-License-Identifier: MIT
+//
+
+module feed
+
+// One service on one loopback port (8484). It keeps feeds — explicit
+// selections of readings (FEED-0001) — reads each item from the application
+// that holds it with a read-only service token (FEED-0002), builds one snapshot
+// per enabled feed (FEED-0003, FEED-0004) and hands it with widget.js
+// (FEED-0005) to the feed's publishers (FEED-0006). Its pages, behind the
+// keeper's sign-in, are where feeds are made and watched (FEED-0007). Nothing
+// outside the machine reaches it (robohub ADR-0019): other sites read only the
+// files a publisher put somewhere.
+//
+// What is the feed's is here, in src/feed (the rules in src/feed/domain, which
+// read no file and are tested on their own); the look, the language, the form
+// token and the toasts are the shared modules included below.
+
+include "settings"
+include "i18n"
+include "ui"
+include "forms"
+include "notifications"
+include "logging"
+include "storage.rho"
+include "db/models.rho"
+include "db/queries.rho"
+include "feed/domain/json.rho"
+include "feed/domain/model.rho"
+include "feed/domain/snapshot.rho"
+include "feed/domain/publish.rho"
+include "feed/domain/access.rho"
+include "feed/store.rho"
+include "feed/sources.rho"
+include "feed/publishers.rho"
+include "feed/refresh.rho"
+include "feed/shell.rho"
+include "feed/pages.rho"
+
+import std.sql
+import std.web.http
+import std.web.template
+import rho.log
+
+route GET  "/"                             => feed_list
+route GET  "/feeds/new"                    => feed_new_page
+route POST "/feeds"                        => feed_create
+route GET  "/feeds/{id}"                   => feed_edit_page
+route POST "/feeds/{id}"                   => feed_save_settings
+route POST "/feeds/{id}/items"             => feed_item_add
+route POST "/feeds/{id}/items/{n}"         => feed_item_save
+route POST "/feeds/{id}/items/{n}/delete"  => feed_item_remove
+route POST "/feeds/{id}/publish"           => feed_publish_now
+route POST "/feeds/{id}/delete"            => feed_delete
+route GET  "/feeds/{id}/preview"           => feed_preview
+route GET  "/publishers"                   => publishers_page
+route POST "/publishers"                   => publisher_save
+route POST "/publishers/{name}/delete"     => publisher_delete
+route GET  "/widget.js"                    => feed_widget
+route GET  "/docs"                         => feed_docs
+
+// init applies the logging settings and makes the workspace's folders and the
+// default publisher.
+fn init() void {
+    log_config_apply("feed")
+    info("feed", "starting")
+    feed_store_init()
+}
+
+// background refreshes each enabled feed when its interval has passed, looking
+// every five seconds (a feed's interval is 30 s at the least).
+// @req FEED-0003, FEED-0006
+fn background() void {
+    rho_sleep_ms(1000)
+    while true {
+        feed_tick()
+        rho_sleep_ms(5000)
+    }
+}

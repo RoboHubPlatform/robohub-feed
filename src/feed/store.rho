@@ -1,0 +1,121 @@
+//
+// @file store.rho
+// @brief Where Feed keeps its feeds, publishers and each feed's state: text files in its workspace, replaced in one step.
+//
+// @module feed
+// @project robohub-feed
+// @author Aurel Miron
+// @date 2026-11-20
+//
+// SPDX-License-Identifier: MIT
+//
+
+module feed
+
+// Everything Feed keeps is in its workspace (RHO_APP_WORKSPACE, which the keeper
+// gives it, readable by its owner only):
+//
+//   feeds.txt         the feeds, their items and the publishers (model.rho)
+//   state/<id>.txt    one feed's last readings, history and publish status
+//   public/           the default directory publisher's folder
+//
+// A file is written whole beside itself and renamed over (rho_write_secret), so
+// a page and the refresh loop never read half of one; a change to feeds.txt is
+// made under one lock, so two forms at once cannot lose each other's change
+// (ADR-0001).
+
+fn feed_dir() string {
+    return app_workspace()
+}
+
+fn feed_file() string {
+    return feed_dir() + "/feeds.txt"
+}
+
+fn feed_state_file(id: string) string {
+    return feed_dir() + "/state/" + id + ".txt"
+}
+
+fn feed_mkdir(dir: string) bool {
+    return rho_exec_args("mkdir", "-p\n" + dir + "\n", "/dev/null") == 0
+}
+
+fn feed_text() string {
+    return rho_read_text(feed_file())
+}
+
+const FEED_FILE_HEAD: string = "# robohub-feed: feeds, items and publishers, one record per line (docs/architecture/adr/0001)\n"
+
+// feed_save replaces feeds.txt. The caller holds the "feed-file" lock.
+fn feed_save(text: string) bool {
+    var body: string = text
+    if str_starts_with(body, "#") {
+        let at: i32 = str_index_of(body, "\n")
+        if at >= 0 {
+            body = str_slice(body, u32(at) + 1, strlen(body) - u32(at) - 1)
+        }
+    }
+    ignore_bool(feed_mkdir(feed_dir()))
+    return rho_write_secret(feed_file(), FEED_FILE_HEAD + body)
+}
+
+fn feed_state(id: string) string {
+    if !fd_id_ok(id) {
+        return ""
+    }
+    return rho_read_text(feed_state_file(id))
+}
+
+fn feed_state_save(id: string, text: string) bool {
+    if !fd_id_ok(id) {
+        return false
+    }
+    ignore_bool(feed_mkdir(feed_dir() + "/state"))
+    return rho_write_secret(feed_state_file(id), text)
+}
+
+fn feed_state_remove(id: string) void {
+    if fd_id_ok(id) {
+        ignore_u32(rho_exec_args("rm", "-f\n" + feed_state_file(id) + "\n", "/dev/null"))
+    }
+}
+
+// feed_new_id is a new feed's id: 24 random hexadecimal characters from the
+// operating system (96 bits), "" when there is no random source (FEED-0001).
+// @req FEED-0001
+fn feed_new_id() string {
+    let id: string = rho_random_hex(12)
+    if !fd_id_ok(id) {
+        return ""
+    }
+    return id
+}
+
+// feed_default_folder is where the default publisher writes: `public` in the
+// workspace, until the person names another folder.
+fn feed_default_folder() string {
+    return feed_dir() + "/public"
+}
+
+// feed_store_init makes the workspace's folders and, the first time, the
+// default directory publisher `local`.
+fn feed_store_init() void {
+    ignore_bool(feed_mkdir(feed_dir() + "/state"))
+    rho_lock("feed-file")
+    let text: string = feed_text()
+    if fd_publisher_lines(text) == "" {
+        ignore_bool(feed_save(fd_replace_publisher(text, "local", fd_publisher_make("local", "directory", feed_default_folder()))))
+    }
+    rho_unlock("feed-file")
+}
+
+// feed_calls are the applications this one may read from: `deploy.calls` of
+// its own manifest, embedded when it was built (FEED-0002).
+// @req FEED-0002
+fn feed_calls() string {
+    return fd_manifest_calls(rho_asset("feed", "module.yml"))
+}
+
+fn feed_home() string {
+    return getenv("HOME")
+}

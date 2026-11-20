@@ -1,0 +1,612 @@
+//
+// @file model.rho
+// @brief Feeds, their items and the publishers as lines of text: reading, writing and the rules each field keeps.
+//
+// @module feed.domain.model
+// @project robohub-feed
+// @author Aurel Miron
+// @date 2026-11-20
+//
+// SPDX-License-Identifier: MIT
+//
+
+module feed.domain.model
+
+// A feed is an explicit selection of readings (FEED-0001). Everything the
+// application keeps of it is one text file in its workspace (ADR-0001), a line
+// per record, its fields separated by `|` and each field percent-encoded so no
+// field can hold a separator or a line break:
+//
+//   feed|<id>|<title>|<interval s>|<enabled 1/0>|<publisher names, comma separated>
+//   item|<feed id>|<label>|<app>|<ref>|<sub>|<unit>|<decimals>|<history>
+//   publisher|<name>|<kind>|<target>
+//
+// An item's source is an application the manifest calls (`app`) and that
+// application's reading: for Mesh a project (`ref`) and a source (`sub`), for
+// an appapi application a value id (`ref`). The items of a feed are kept in
+// order, after their feed's line; an item's position is its key in a snapshot.
+//
+// Nothing here reads a file or the clock, so it is tested on its own
+// (tests/feed_test.rho).
+
+// The shortest and longest refresh a feed may have (FEED-0001).
+const FD_INTERVAL_MIN: u32 = 30
+const FD_INTERVAL_MAX: u32 = 86400
+
+// How many items a feed and how many feeds the application keep: enough for
+// any page, and a bound on what one refresh asks of the applications it reads.
+const FD_ITEMS_MAX: u32 = 24
+const FD_FEEDS_MAX: u32 = 64
+
+fn fd_enc(value: string) string {
+    return str_url_encode(value)
+}
+
+// fd_field is field `index` (from 0) of a record, decoded.
+fn fd_field(line: string, index: u32) string {
+    return str_url_decode(str_field(line, "|", index))
+}
+
+fn fd_kind(line: string) string {
+    return str_field(line, "|", 0)
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Records                                                                   */
+/* -------------------------------------------------------------------------- */
+
+fn fd_feed_make(id: string, title: string, interval: u32, enabled: bool, publishers: string) string {
+    var on: string = "0"
+    if enabled {
+        on = "1"
+    }
+    return "feed|" + fd_enc(id) + "|" + fd_enc(title) + "|" + int_to_str(interval) + "|" + on + "|" + fd_enc(publishers)
+}
+
+fn fd_item_make(feed: string, label: string, app: string, ref: string, sub: string,
+    unit: string, decimals: string, history: string) string {
+    return "item|" + fd_enc(feed) + "|" + fd_enc(label) + "|" + fd_enc(app) + "|" + fd_enc(ref) + "|" +
+        fd_enc(sub) + "|" + fd_enc(unit) + "|" + fd_enc(decimals) + "|" + fd_enc(history)
+}
+
+fn fd_publisher_make(name: string, kind: string, target: string) string {
+    return "publisher|" + fd_enc(name) + "|" + fd_enc(kind) + "|" + fd_enc(target)
+}
+
+// The fields of a feed line.
+fn fd_feed_id(line: string) string { return fd_field(line, 1) }
+fn fd_feed_title(line: string) string { return fd_field(line, 2) }
+fn fd_feed_interval(line: string) u32 { return int_from_str(fd_field(line, 3)) }
+fn fd_feed_enabled(line: string) bool { return str_eq(fd_field(line, 4), "1") }
+fn fd_feed_publishers(line: string) string { return fd_field(line, 5) }
+
+// The fields of an item line.
+fn fd_item_label(line: string) string { return fd_field(line, 2) }
+fn fd_item_app(line: string) string { return fd_field(line, 3) }
+fn fd_item_ref(line: string) string { return fd_field(line, 4) }
+fn fd_item_sub(line: string) string { return fd_field(line, 5) }
+fn fd_item_unit(line: string) string { return fd_field(line, 6) }
+fn fd_item_decimals(line: string) string { return fd_field(line, 7) }
+fn fd_item_history(line: string) string { return fd_field(line, 8) }
+
+// The fields of a publisher line.
+fn fd_publisher_name(line: string) string { return fd_field(line, 1) }
+fn fd_publisher_kind(line: string) string { return fd_field(line, 2) }
+fn fd_publisher_target(line: string) string { return fd_field(line, 3) }
+
+// fd_source_id is what an item reads, as one token: where its last reading and
+// history are kept in the workspace. It never leaves the workspace.
+fn fd_source_id(app: string, ref: string, sub: string) string {
+    return fd_enc(app) + "/" + fd_enc(ref) + "/" + fd_enc(sub)
+}
+
+fn fd_item_source(line: string) string {
+    return fd_source_id(fd_item_app(line), fd_item_ref(line), fd_item_sub(line))
+}
+
+/* -------------------------------------------------------------------------- */
+/*  The file                                                                  */
+/* -------------------------------------------------------------------------- */
+
+// fd_lines are the records of one kind, each ending with a line break; with an
+// owner, only those whose first field is it (a feed's items, one publisher).
+fn fd_lines(text: string, kind: string, owner: string) string {
+    var out: string = ""
+    var rest: string = text
+    while rest != "" {
+        let at: i32 = str_index_of(rest, "\n")
+        var line: string = rest
+        if at < 0 {
+            rest = ""
+        } else {
+            line = str_slice(rest, 0, u32(at))
+            rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        }
+        if str_eq(fd_kind(line), kind) && (owner == "" || str_eq(fd_field(line, 1), owner)) {
+            out = out + line + "\n"
+        }
+    }
+    return out
+}
+
+// fd_feed_ids are the feeds' ids, one per line, in the order they were made.
+fn fd_feed_ids(text: string) string {
+    var out: string = ""
+    var rest: string = fd_lines(text, "feed", "")
+    while rest != "" {
+        let at: i32 = str_index_of(rest, "\n")
+        let line: string = str_slice(rest, 0, u32(at))
+        rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        out = out + fd_feed_id(line) + "\n"
+    }
+    return out
+}
+
+fn fd_feed_line(text: string, id: string) string {
+    if id == "" {
+        return ""
+    }
+    let found: string = fd_lines(text, "feed", id)
+    let at: i32 = str_index_of(found, "\n")
+    if at < 0 {
+        return ""
+    }
+    return str_slice(found, 0, u32(at))
+}
+
+// fd_items are a feed's item lines, in order, each ending with a line break.
+fn fd_items(text: string, id: string) string {
+    return fd_lines(text, "item", id)
+}
+
+// fd_item_at is a feed's item at a position, from 1; "" when there is none.
+fn fd_item_at(items: string, position: u32) string {
+    if position == 0 {
+        return ""
+    }
+    return str_field(items, "\n", position - 1)
+}
+
+// fd_items_without is the items without the one at a position (from 1).
+fn fd_items_without(items: string, position: u32) string {
+    var out: string = ""
+    var i: u32 = 1
+    let n: u32 = fd_line_count(items)
+    while i <= n {
+        if i != position {
+            out = out + fd_item_at(items, i) + "\n"
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// fd_items_with is the items with the one at a position (from 1) replaced.
+fn fd_items_with(items: string, position: u32, line: string) string {
+    var out: string = ""
+    var i: u32 = 1
+    let n: u32 = fd_line_count(items)
+    while i <= n {
+        if i == position {
+            out = out + line + "\n"
+        } else {
+            out = out + fd_item_at(items, i) + "\n"
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn fd_line_count(text: string) u32 {
+    var n: u32 = 0
+    var i: u32 = 0
+    let length: u32 = strlen(text)
+    while i < length {
+        if str_at(text, i) == 10 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    if length > 0 && str_at(text, length - 1) != 10 {
+        n = n + 1
+    }
+    return n
+}
+
+// fd_replace_feed is the file with one feed's line and items replaced: a feed
+// line of "" removes the feed and its items; a feed not in the file is added at
+// the end. Every other record is kept as it was, in its place.
+fn fd_replace_feed(text: string, id: string, feed_line: string, items: string) string {
+    var out: string = ""
+    var placed: bool = false
+    var rest: string = text
+    while rest != "" {
+        let at: i32 = str_index_of(rest, "\n")
+        var line: string = rest
+        if at < 0 {
+            rest = ""
+        } else {
+            line = str_slice(rest, 0, u32(at))
+            rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        }
+        if line == "" {
+            continue
+        }
+        let kind: string = fd_kind(line)
+        if (str_eq(kind, "feed") || str_eq(kind, "item")) && str_eq(fd_field(line, 1), id) {
+            if str_eq(kind, "feed") && feed_line != "" && !placed {
+                out = out + feed_line + "\n" + items
+                placed = true
+            }
+            continue
+        }
+        out = out + line + "\n"
+    }
+    if !placed && feed_line != "" {
+        out = out + feed_line + "\n" + items
+    }
+    return out
+}
+
+fn fd_publisher_lines(text: string) string {
+    return fd_lines(text, "publisher", "")
+}
+
+fn fd_publisher_line(text: string, name: string) string {
+    if name == "" {
+        return ""
+    }
+    let found: string = fd_lines(text, "publisher", name)
+    let at: i32 = str_index_of(found, "\n")
+    if at < 0 {
+        return ""
+    }
+    return str_slice(found, 0, u32(at))
+}
+
+// fd_replace_publisher is the file with one publisher replaced, added (at the
+// end) or, for a line of "", removed.
+fn fd_replace_publisher(text: string, name: string, publisher_line: string) string {
+    var out: string = ""
+    var placed: bool = false
+    var rest: string = text
+    while rest != "" {
+        let at: i32 = str_index_of(rest, "\n")
+        var line: string = rest
+        if at < 0 {
+            rest = ""
+        } else {
+            line = str_slice(rest, 0, u32(at))
+            rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        }
+        if line == "" {
+            continue
+        }
+        if str_eq(fd_kind(line), "publisher") && str_eq(fd_field(line, 1), name) {
+            if publisher_line != "" && !placed {
+                out = out + publisher_line + "\n"
+                placed = true
+            }
+            continue
+        }
+        out = out + line + "\n"
+    }
+    if !placed && publisher_line != "" {
+        out = out + publisher_line + "\n"
+    }
+    return out
+}
+
+// fd_feeds_using are the feeds that name a publisher, one id per line.
+fn fd_feeds_using(text: string, name: string) string {
+    var out: string = ""
+    var rest: string = fd_lines(text, "feed", "")
+    while rest != "" {
+        let at: i32 = str_index_of(rest, "\n")
+        let line: string = str_slice(rest, 0, u32(at))
+        rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        if fd_list_has(fd_feed_publishers(line), name) {
+            out = out + fd_feed_id(line) + "\n"
+        }
+    }
+    return out
+}
+
+// fd_list_has is whether a comma-separated list holds a name.
+fn fd_list_has(list: string, name: string) bool {
+    if name == "" {
+        return false
+    }
+    var i: u32 = 0
+    let n: u32 = fd_comma_count(list)
+    while i <= n {
+        if str_eq(str_trim(str_field(list, ",", i)), name) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn fd_comma_count(list: string) u32 {
+    var n: u32 = 0
+    var i: u32 = 0
+    let length: u32 = strlen(list)
+    while i < length {
+        if str_at(list, i) == 44 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+/* -------------------------------------------------------------------------- */
+/*  The rules each field keeps                                                */
+/* -------------------------------------------------------------------------- */
+
+fn fd_hex_digit(c: u8) bool {
+    return (c >= 48 && c <= 57) || (c >= 97 && c <= 102)
+}
+
+// fd_id_ok is whether a feed id has the shape the application makes: at least
+// 16 lowercase hexadecimal characters (FEED-0001), at most 64. The id is also a
+// file name in every publisher, so nothing else may be in it.
+// @req FEED-0001
+fn fd_id_ok(id: string) bool {
+    let n: u32 = strlen(id)
+    if n < 16 || n > 64 {
+        return false
+    }
+    var i: u32 = 0
+    while i < n {
+        if !fd_hex_digit(str_at(id, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// fd_interval_ok is whether a refresh interval is one a feed may have: 30 s at
+// the least (FEED-0001), a day at the most.
+// @req FEED-0001
+fn fd_interval_ok(seconds: u32) bool {
+    return seconds >= FD_INTERVAL_MIN && seconds <= FD_INTERVAL_MAX
+}
+
+// fd_text_ok is whether free text is short enough and holds no control
+// character: a title, a label, a unit.
+fn fd_text_ok(value: string, max: u32) bool {
+    let n: u32 = strlen(value)
+    if n > max {
+        return false
+    }
+    var i: u32 = 0
+    while i < n {
+        let c: u8 = str_at(value, i)
+        if c < 32 || c == 127 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// fd_name_ok is whether a name is an application's or a publisher's: a letter,
+// then letters, digits and hyphens, 32 at the most.
+fn fd_name_ok(name: string) bool {
+    let n: u32 = strlen(name)
+    if n == 0 || n > 32 {
+        return false
+    }
+    var i: u32 = 0
+    while i < n {
+        let c: u8 = str_at(name, i)
+        let letter: bool = c >= 97 && c <= 122
+        let digit: bool = c >= 48 && c <= 57
+        if i == 0 && !letter {
+            return false
+        }
+        if !letter && !digit && c != 45 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// fd_ref_ok is whether a reference to another application's reading — a Mesh
+// project, a Mesh source, an appapi value id — is one that can travel in a path
+// and in a scope as it is: letters, digits, `.`, `_`, `:` and `-`, 128 at most.
+fn fd_ref_ok(ref: string) bool {
+    let n: u32 = strlen(ref)
+    if n == 0 || n > 128 {
+        return false
+    }
+    var i: u32 = 0
+    while i < n {
+        let c: u8 = str_at(ref, i)
+        let ok: bool = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) ||
+            c == 46 || c == 95 || c == 58 || c == 45
+        if !ok {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// fd_history_seconds is how far back an item's history reaches: none, an hour
+// or a day (FEED-0001). 0 is none, and anything else is not a window.
+fn fd_history_seconds(window: string) u32 {
+    if str_eq(window, "1h") {
+        return 3600
+    }
+    if str_eq(window, "24h") {
+        return 86400
+    }
+    return 0
+}
+
+fn fd_history_ok(window: string) bool {
+    return str_eq(window, "none") || str_eq(window, "1h") || str_eq(window, "24h")
+}
+
+// fd_decimals_ok is whether a number of decimals is none or 0 to 3: a value is
+// held as thousandths.
+fn fd_decimals_ok(decimals: string) bool {
+    return decimals == "" || str_eq(decimals, "0") || str_eq(decimals, "1") ||
+        str_eq(decimals, "2") || str_eq(decimals, "3")
+}
+
+// fd_validate_feed is what is wrong with a feed's fields, as the key of the
+// message that says so, or "" when nothing is. Every publisher it names must be
+// one the application has.
+// @req FEED-0001, FEED-0006
+fn fd_validate_feed(title: string, interval: string, publishers: string, text: string) string {
+    if str_trim(title) == "" || !fd_text_ok(title, 120) {
+        return "feed.error.title"
+    }
+    if !fd_digits(interval) || !fd_interval_ok(int_from_str(interval)) {
+        return "feed.error.interval"
+    }
+    var i: u32 = 0
+    while i <= fd_comma_count(publishers) {
+        let name: string = str_trim(str_field(publishers, ",", i))
+        if name != "" && fd_publisher_line(text, name) == "" {
+            return "feed.error.publisher"
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn fd_digits(value: string) bool {
+    let n: u32 = strlen(value)
+    if n == 0 || n > 9 {
+        return false
+    }
+    var i: u32 = 0
+    while i < n {
+        let c: u8 = str_at(value, i)
+        if c < 48 || c > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// fd_validate_item is what is wrong with an item, or "": a label, a source in an
+// application the manifest calls, a unit, decimals and a history window that
+// are allowed. A Mesh source names a project and a source; an appapi value names
+// its id and nothing more.
+// @req FEED-0001, FEED-0002
+fn fd_validate_item(label: string, app: string, ref: string, sub: string, unit: string,
+    decimals: string, history: string, calls: string) string {
+    if str_trim(label) == "" || !fd_text_ok(label, 80) {
+        return "item.error.label"
+    }
+    if !fd_name_ok(app) || !fd_list_has(calls, app) {
+        return "item.error.app"
+    }
+    if !fd_ref_ok(ref) {
+        return "item.error.source"
+    }
+    if str_eq(app, "mesh") {
+        if !fd_ref_ok(sub) {
+            return "item.error.source"
+        }
+    } else if sub != "" {
+        return "item.error.source"
+    }
+    if !fd_text_ok(unit, 16) {
+        return "item.error.unit"
+    }
+    if !fd_decimals_ok(decimals) {
+        return "item.error.decimals"
+    }
+    if !fd_history_ok(history) {
+        return "item.error.history"
+    }
+    return ""
+}
+
+/* -------------------------------------------------------------------------- */
+/*  The applications a feed reads from                                        */
+/* -------------------------------------------------------------------------- */
+
+// fd_manifest_calls is `deploy.calls` of a manifest, as a comma-separated list:
+// the applications the keeper lets this one ask a token for, and the only ones
+// it reads from (FEED-0002). Only the flow form, `calls: [a, b]`, is read,
+// which is the form every RoboHub manifest writes it in.
+// @req FEED-0002
+fn fd_manifest_calls(manifest: string) string {
+    let deploy: i32 = str_index_of(manifest, "\ndeploy:")
+    if deploy < 0 {
+        return ""
+    }
+    let tail: string = str_slice(manifest, u32(deploy) + 8, strlen(manifest) - u32(deploy) - 8)
+    // The block ends at the next line that starts at the margin.
+    var block: string = tail
+    var i: u32 = 0
+    let n: u32 = strlen(tail)
+    while i + 1 < n {
+        if str_at(tail, i) == 10 {
+            let c: u8 = str_at(tail, i + 1)
+            if c != 32 && c != 10 && c != 35 {
+                block = str_slice(tail, 0, i)
+                break
+            }
+        }
+        i = i + 1
+    }
+    let at: i32 = str_index_of(block, "\n  calls:")
+    if at < 0 {
+        return ""
+    }
+    var line: string = str_slice(block, u32(at) + 9, strlen(block) - u32(at) - 9)
+    let end: i32 = str_index_of(line, "\n")
+    if end >= 0 {
+        line = str_slice(line, 0, u32(end))
+    }
+    let open: i32 = str_index_of(line, "[")
+    let close: i32 = str_index_of(line, "]")
+    if open < 0 || close < open {
+        return ""
+    }
+    let inner: string = str_slice(line, u32(open) + 1, u32(close) - u32(open) - 1)
+    var out: string = ""
+    var k: u32 = 0
+    while k <= fd_comma_count(inner) {
+        let name: string = str_trim(str_field(inner, ",", k))
+        if fd_name_ok(name) {
+            if out != "" {
+                out = out + ","
+            }
+            out = out + name
+        }
+        k = k + 1
+    }
+    return out
+}
+
+// fd_env_name is the part of RHO_SERVICE_<NAME>_URL an application's name is.
+fn fd_env_name(app: string) string {
+    return str_replace(str_upper(app), "-", "_")
+}
+
+// fd_scope is the read-only scope a reading is asked for with: one Mesh
+// project's `mesh:<project>:read`, or an application's `<app>:read`, which is
+// all its appapi needs (FEED-0002). Never a scope that could change anything.
+// @req FEED-0002
+fn fd_scope(app: string, ref: string) string {
+    if str_eq(app, "mesh") {
+        if ref == "" {
+            return "mesh:read"
+        }
+        return "mesh:" + ref + ":read"
+    }
+    return app + ":read"
+}

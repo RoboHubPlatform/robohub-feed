@@ -1,0 +1,217 @@
+//
+// @file sources.rho
+// @brief Reading an item's value and history from the application that holds it, and listing what the called applications offer.
+//
+// @module feed
+// @project robohub-feed
+// @author Aurel Miron
+// @date 2026-11-20
+//
+// SPDX-License-Identifier: MIT
+//
+
+module feed
+
+// Feed reads from the applications its manifest calls (`deploy.calls`), at the
+// address the keeper gives each (`RHO_SERVICE_<NAME>_URL`), with a service token
+// the runtime obtains for that application's audience and a read-only scope
+// (FEED-0002). An application the manifest does not call is never asked, even
+// when an address for it is in the environment.
+//
+//   Mesh     GET /mesh/api/projects                               mesh:read
+//            GET /mesh/api/projects/{project}/sources             mesh:<project>:read
+//            GET /mesh/api/projects/{project}/sources/{source}/value
+//   appapi   GET /api/v1/values, /api/v1/values/{id}, …/history   <app>:read
+
+// feed_service_url is where a called application is, without a trailing
+// slash, or "" when the manifest does not call it or the keeper gave no
+// address.
+// @req FEED-0002
+fn feed_service_url(app: string) string {
+    if !fd_name_ok(app) || !fd_list_has(feed_calls(), app) {
+        return ""
+    }
+    var url: string = getenv("RHO_SERVICE_" + fd_env_name(app) + "_URL")
+    while strlen(url) > 0 && str_at(url, strlen(url) - 1) == 47 {
+        url = str_slice(url, 0, strlen(url) - 1)
+    }
+    return url
+}
+
+// feed_get is what a called application answers a GET with, with a token for
+// its audience and the scope given; "" when it did not answer with a success.
+// @req FEED-0002
+fn feed_get(app: string, path: string, scope: string) string {
+    let base: string = feed_service_url(app)
+    if base == "" {
+        return ""
+    }
+    return rho_http_body("GET", base + path, "", "", app, scope)
+}
+
+fn feed_path_part(value: string) string {
+    return str_url_encode(value)
+}
+
+// feed_read_item is an item's reading now, as `<taken at>|<value>` (the value
+// percent-encoded), or "" when its source could not be read. Mesh answers a
+// source's value as plain text and says nothing of when it was taken, so its
+// time is the time it was asked; appapi answers the time it was updated.
+// @req FEED-0002
+fn feed_read_item(item: string, now: u32) string {
+    let app: string = fd_item_app(item)
+    let ref: string = fd_item_ref(item)
+    if str_eq(app, "mesh") {
+        let body: string = feed_get("mesh", "/mesh/api/projects/" + feed_path_part(ref) + "/sources/" +
+            feed_path_part(fd_item_sub(item)) + "/value", fd_scope("mesh", ref))
+        let value: string = str_trim(body)
+        if value == "" || strlen(value) > 64 || str_contains(value, "\n") || str_starts_with(value, "{") ||
+            str_starts_with(value, "[") || str_starts_with(value, "<") {
+            return ""
+        }
+        return int_to_str(now) + "|" + str_url_encode(value)
+    }
+    let body: string = feed_get(app, "/api/v1/values/" + feed_path_part(ref), fd_scope(app, ref))
+    let value: string = str_trim(fj_get(body, "value"))
+    if value == "" || strlen(value) > 64 || !fd_text_ok(value, 64) {
+        return ""
+    }
+    var at: u32 = int_from_str(fj_get(body, "updated_at"))
+    if at == 0 || at > now + 300 {
+        at = now
+    }
+    return int_to_str(at) + "|" + str_url_encode(value)
+}
+
+// feed_read_history is an appapi value's history since a time, as point lines
+// of the state file, oldest first; "" when it could not be read.
+// @req FEED-0002
+fn feed_read_history(item: string, source: string, since: u32, now: u32) string {
+    let app: string = fd_item_app(item)
+    let ref: string = fd_item_ref(item)
+    let body: string = feed_get(app, "/api/v1/values/" + feed_path_part(ref) + "/history?from=" +
+        int_to_str(since) + "000&to=" + int_to_str(now) + "000", fd_scope(app, ref))
+    if body == "" {
+        return ""
+    }
+    var out: string = ""
+    var rest: string = fj_items(fj_member(body, "points"))
+    while rest != "" {
+        let at: i32 = str_index_of(rest, "\n")
+        let point: string = str_slice(rest, 0, u32(at))
+        rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        let ms: i64 = i64_from_str(fj_get(point, "t"))
+        let v: string = fj_get(point, "v")
+        if ms > 0 && milli_valid(v) {
+            let t: u32 = u32(ms / 1000)
+            if t >= since && t <= now + 300 {
+                out = out + fs_point_make(source, t, v) + "\n"
+            }
+        }
+    }
+    return out
+}
+
+// feed_option is one entry of the source picker: `<value>\t<label>\t<unit>`,
+// where the value is the item's source as the form posts it, `app|ref|sub`.
+fn feed_option(app: string, ref: string, sub: string, label: string, unit: string) string {
+    let value: string = fd_enc(app) + "|" + fd_enc(ref) + "|" + fd_enc(sub)
+    return value + "\t" + str_replace(label, "\t", " ") + "\t" + str_replace(unit, "\t", " ") + "\n"
+}
+
+// feed_source_options is what the called applications offer to read, for the
+// source picker (FEED-0007): every Mesh project's sources, and every appapi
+// application's values, as feed_option lines. An application that did not
+// answer is a line `!<app>`, so the page can say so.
+// @req FEED-0007
+fn feed_source_options() string {
+    var out: string = ""
+    let calls: string = feed_calls()
+    var i: u32 = 0
+    while i <= fd_comma_count(calls) {
+        let app: string = str_trim(str_field(calls, ",", i))
+        i = i + 1
+        if app == "" {
+            continue
+        }
+        if str_eq(app, "mesh") {
+            out = out + feed_mesh_options()
+        } else {
+            out = out + feed_appapi_options(app)
+        }
+    }
+    return out
+}
+
+fn feed_mesh_options() string {
+    let projects: string = feed_get("mesh", "/mesh/api/projects", fd_scope("mesh", ""))
+    if projects == "" {
+        return "!mesh\n"
+    }
+    var out: string = ""
+    var rest: string = fj_items(projects)
+    while rest != "" {
+        let at: i32 = str_index_of(rest, "\n")
+        let project: string = str_slice(rest, 0, u32(at))
+        rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        let id: string = fj_get(project, "id")
+        if !fd_ref_ok(id) {
+            continue
+        }
+        var name: string = fj_get(project, "name")
+        if name == "" {
+            name = id
+        }
+        let sources: string = feed_get("mesh", "/mesh/api/projects/" + feed_path_part(id) + "/sources",
+            fd_scope("mesh", id))
+        var list: string = fj_items(sources)
+        while list != "" {
+            let k: i32 = str_index_of(list, "\n")
+            let source: string = str_slice(list, 0, u32(k))
+            list = str_slice(list, u32(k) + 1, strlen(list) - u32(k) - 1)
+            let sid: string = fj_get(source, "id")
+            if !fd_ref_ok(sid) {
+                continue
+            }
+            var label: string = fj_get(source, "name")
+            if label == "" {
+                label = fj_get(source, "label")
+            }
+            out = out + feed_option("mesh", id, sid, "Mesh · " + name + " · " + label, fj_get(source, "unit"))
+        }
+    }
+    return out
+}
+
+fn feed_appapi_options(app: string) string {
+    let body: string = feed_get(app, "/api/v1/values", fd_scope(app, ""))
+    if body == "" {
+        return "!" + app + "\n"
+    }
+    var out: string = ""
+    var rest: string = fj_items(fj_member(body, "values"))
+    while rest != "" {
+        let at: i32 = str_index_of(rest, "\n")
+        let value: string = str_slice(rest, 0, u32(at))
+        rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        let id: string = fj_get(value, "id")
+        if !fd_ref_ok(id) {
+            continue
+        }
+        var label: string = fj_get(value, "label")
+        if label == "" {
+            label = id
+        }
+        out = out + feed_option(app, id, "", feed_app_title(app) + " · " + label, fj_get(value, "unit"))
+    }
+    return out
+}
+
+// feed_app_title is how an application is named on the picker: its name with a
+// capital, `Aquarium`.
+fn feed_app_title(app: string) string {
+    if app == "" {
+        return ""
+    }
+    return str_upper(str_slice(app, 0, 1)) + str_slice(app, 1, strlen(app) - 1)
+}

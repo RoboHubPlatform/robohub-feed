@@ -1,0 +1,135 @@
+# What robohub-feed does: chosen readings of the installation published outward
+# as static snapshots and a widget script (robohub SYS-0071, ADR-0019). Proposed,
+# with robohub ADR-0019, for the maintainer to decide.
+level: NODE
+prefix: FEED
+title: robohub-feed
+requirements:
+  - id: FEED-0001
+    title: A feed is an explicit selection of readings
+    statement: >
+      The feed application shall keep feeds, each with a title, an id of at
+      least 16 random hexadecimal characters it makes, a refresh interval of at
+      least 30 s, whether it is enabled, its publishers, and items — each with a
+      label, a source (an application the manifest calls and that application's
+      reading: a Mesh project and source, or an appapi value), an optional unit
+      and number of decimals, and an optional history window (none, 1 h or 24 h).
+    rationale: Only what the person chose leaves the installation; an unguessable id keeps one feed's address from leading to another.
+    satisfies: [SYS-0071]
+    decided_by: [robohub:ADR-0019]
+    status: approved
+    verification: test
+    owner: maintainer
+    changed: 2026-11-20
+    tags: [feed, model]
+
+  - id: FEED-0002
+    title: Readings are read with read-only service tokens from the applications it calls
+    statement: >
+      The feed application shall read a Mesh source from
+      `/mesh/api/projects/{project}/sources/{source}/value` and an appapi value
+      from `/api/v1/values/{id}` (and its history from `.../history`), at the
+      address the keeper gives (`RHO_SERVICE_<NAME>_URL`), with a service token
+      for that application's audience and a read-only scope, and from no
+      application its manifest's `deploy.calls` does not list.
+    rationale: The feed must be able to read exactly what it publishes and nothing it could change (SYS-0031).
+    satisfies: [SYS-0071]
+    decided_by: [robohub:ADR-0019]
+    status: approved
+    verification: test
+    owner: maintainer
+    changed: 2026-11-20
+    tags: [feed, sources, least-privilege]
+
+  - id: FEED-0003
+    title: A snapshot carries labels, values, units and times, and nothing else
+    statement: >
+      Each refresh shall make one snapshot per enabled feed —
+      `feeds/<id>.json`: `format: "robohub-feed"`, `schema: 1`, the feed's id and
+      title, `updated_at` (UTC, ISO 8601), its refresh interval, and `items`, each
+      with a key (the item's position-based key), label, value (a number, or a
+      string for a word state), unit, `at` (when the reading was taken) and
+      `stale`, and, for items with history, `history` as `[time, value]` pairs —
+      and no application, project, node or source identifier, address, token or
+      anything else; the repository shall publish `schemas/feed.v1.json` and a
+      test shall hold every snapshot written to it.
+    rationale: Whatever is in a snapshot is public; a snapshot that names internals would map the installation for anyone who reads it.
+    satisfies: [SYS-0071]
+    decided_by: [robohub:ADR-0019]
+    status: approved
+    verification: test
+    owner: maintainer
+    changed: 2026-11-20
+    tags: [feed, format, privacy]
+
+  - id: FEED-0004
+    title: A reading that stops arriving is published as stale
+    statement: >
+      An item shall be `stale` when its reading is older than three refresh
+      intervals or 5 minutes, whichever is longer; a source that cannot be read
+      shall keep its last value, marked stale, and the snapshot shall still be
+      published.
+    rationale: A widget on another site must never show a frozen value as current, nor go blank because one source failed.
+    satisfies: [SYS-0071]
+    decided_by: [robohub:ADR-0019]
+    status: approved
+    verification: test
+    owner: maintainer
+    changed: 2026-11-20
+    tags: [feed, staleness]
+
+  - id: FEED-0005
+    title: One widget script shows a feed's items on any page
+    statement: >
+      The feed application shall publish `widget.js`, one script with no
+      dependency, defining a custom element `robohub-widget` with attributes
+      `src` (a snapshot's URL), `item` (an item key, or none for all) and `kind`
+      (`number`, `chart` or `table`), that fetches the snapshot without
+      credentials, renders it, refreshes at the snapshot's interval, marks a stale
+      item as such, follows the page's light or dark scheme, and stores nothing,
+      sets no cookie and loads nothing else.
+    rationale: A person embedding a reading on another site should need one script tag and one element, and the site's visitors should be tracked by nothing.
+    satisfies: [SYS-0071]
+    decided_by: [robohub:ADR-0019]
+    status: approved
+    verification: test
+    owner: maintainer
+    changed: 2026-11-20
+    tags: [feed, widget]
+
+  - id: FEED-0006
+    title: Publishers are pluggable, with a directory publisher first
+    statement: >
+      Each feed shall name its publishers; a publisher shall receive the files of
+      one refresh (the snapshots and `widget.js`) and put each in place
+      atomically (written beside it, then renamed); the first kind shall be
+      `directory`, a folder on this machine; a failed publish shall be recorded
+      with its reason and tried again on the next refresh, and the other kinds
+      shall be refused until they exist.
+    rationale: Where the snapshots are hosted is decided later (robohub ADR-0019); the feed must already be complete and testable end to end.
+    satisfies: [SYS-0071]
+    decided_by: [robohub:ADR-0019]
+    status: approved
+    verification: test
+    owner: maintainer
+    changed: 2026-11-20
+    tags: [feed, publishers]
+
+  - id: FEED-0007
+    title: Feeds are made and watched from the application's pages
+    statement: >
+      The application's pages, behind the keeper's sign-in and its grants
+      (`feed:*` to change, `feed:read` to look), shall list the feeds with their
+      last refresh, last publish and any error, let a person create, edit,
+      disable and delete a feed — picking each item's source from what the called
+      applications list — preview its widget, and publish now; every change shall
+      be a form from the application's own pages; deleting a feed shall remove
+      its snapshot from its directory publishers.
+    rationale: Choosing what goes public is a deliberate act a person must see the result of before it is published.
+    satisfies: [SYS-0071]
+    decided_by: [robohub:ADR-0019]
+    status: approved
+    verification: test
+    owner: maintainer
+    changed: 2026-11-20
+    tags: [feed, ui, access]

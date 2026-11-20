@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/RoboHubPlatform/robohub-feed/schemas/feed.v1.json",
+  "title": "RoboHub feed snapshot, schema 1",
+  "description": "One feed's snapshot as robohub-feed publishes it (FEED-0003): labels, values, units and times, and nothing else. No application, project, node or source identifier, address or token is allowed anywhere in it; additionalProperties is false at every level so a new member is a new schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "schema", "id", "title", "updated_at", "refresh", "items"],
+  "properties": {
+    "format": { "const": "robohub-feed" },
+    "schema": { "const": 1 },
+    "id": {
+      "description": "The feed's id: at least 16 random lowercase hexadecimal characters, also the snapshot's file name.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{16,64}$"
+    },
+    "title": { "type": "string", "maxLength": 120 },
+    "updated_at": { "$ref": "#/$defs/time" },
+    "refresh": {
+      "description": "The feed's refresh interval in seconds; a widget fetches the snapshot again after it.",
+      "type": "integer",
+      "minimum": 30,
+      "maximum": 86400
+    },
+    "items": {
+      "type": "array",
+      "maxItems": 24,
+      "items": { "$ref": "#/$defs/item" }
+    }
+  },
+  "$defs": {
+    "time": {
+      "description": "A UTC time in ISO 8601, to the second.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "value": {
+      "description": "A reading: a number, a string for a word state such as \"on\", or null before the first reading.",
+      "type": ["number", "string", "null"],
+      "maxLength": 64
+    },
+    "item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "label", "value", "unit", "at", "stale"],
+      "properties": {
+        "key": {
+          "description": "The item's position in the feed, i1 for the first: never the source it reads.",
+          "type": "string",
+          "pattern": "^i[1-9][0-9]*$"
+        },
+        "label": { "type": "string", "maxLength": 80 },
+        "value": { "$ref": "#/$defs/value" },
+        "unit": { "type": "string", "maxLength": 16 },
+        "at": {
+          "description": "When the reading was taken; null before the first reading.",
+          "anyOf": [{ "$ref": "#/$defs/time" }, { "type": "null" }]
+        },
+        "stale": {
+          "description": "True when the reading is older than three refresh intervals or 5 minutes, whichever is longer, or its source could not be read at the last refresh (FEED-0004).",
+          "type": "boolean"
+        },
+        "history": {
+          "description": "For an item with a history window: [time, value] pairs, oldest first, at most 96.",
+          "type": "array",
+          "maxItems": 96,
+          "items": {
+            "type": "array",
+            "prefixItems": [{ "$ref": "#/$defs/time" }, { "type": "number" }],
+            "items": false,
+            "minItems": 2
+          }
+        }
+      }
+    }
+  }
+}

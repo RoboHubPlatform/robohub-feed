@@ -1,0 +1,183 @@
+//
+// @file refresh.rho
+// @brief One refresh of a feed — read every item, build the snapshot, hand it to the publishers — and the loop that runs them.
+//
+// @module feed
+// @project robohub-feed
+// @author Aurel Miron
+// @date 2026-11-20
+//
+// SPDX-License-Identifier: MIT
+//
+
+module feed
+
+// A refresh reads each item of one feed from the application that holds it,
+// remembers the reading (or that there was none), builds the feed's snapshot,
+// checks nothing internal is in it, and hands it with widget.js to each of the
+// feed's publishers. A source that cannot be read keeps its last value, marked
+// stale, and the snapshot is still published (FEED-0004); a publisher that
+// fails is recorded with its reason and tried again at the next refresh
+// (FEED-0006). Refreshes are one at a time: the loop's and a "publish now"
+// from a page take the same lock.
+
+// The most history points kept per source in the state file: a day of 30 s
+// readings.
+const FEED_POINTS_KEPT: u32 = 2880
+
+// feed_refresh refreshes one feed and answers what went wrong in publishing it
+// ("" when nothing did). A disabled feed is refreshed only when `forced`; a
+// feed that does not exist answers "missing".
+// @req FEED-0002, FEED-0003, FEED-0004, FEED-0006
+fn feed_refresh(id: string, forced: bool) string {
+    if !fd_id_ok(id) {
+        return "missing"
+    }
+    rho_lock("feed-refresh")
+    let text: string = feed_text()
+    let feed: string = fd_feed_line(text, id)
+    if feed == "" {
+        rho_unlock("feed-refresh")
+        return "missing"
+    }
+    if !fd_feed_enabled(feed) && !forced {
+        rho_unlock("feed-refresh")
+        return "disabled"
+    }
+    let items: string = fd_items(text, id)
+    let old: string = feed_state(id)
+    let now: u32 = rho_now_s()
+    var body: string = ""
+    var seen: string = "\n"
+    var unread: u32 = 0
+    var position: u32 = 1
+    let n: u32 = fd_line_count(items)
+    while position <= n {
+        let item: string = fd_item_at(items, position)
+        position = position + 1
+        let source: string = fd_item_source(item)
+        if str_contains(seen, "\n" + source + "\n") {
+            continue
+        }
+        seen = seen + source + "\n"
+        body = body + feed_refresh_item(item, source, old, now)
+        if !fs_last_read(fs_last(body, source)) {
+            unread = unread + 1
+        }
+    }
+    let snapshot: string = fs_snapshot(feed, items, body, now)
+    var errors: string = ""
+    let leak: string = fs_leak(snapshot, fs_internal(items, feed_addresses()), fs_chosen(feed, items, body))
+    if leak != "" {
+        errors = "the snapshot held an internal identifier and was not published"
+    } else {
+        errors = feed_publish(text, feed, snapshot)
+    }
+    var published: u32 = fs_status_published(old)
+    if errors == "" {
+        published = now
+    }
+    ignore_bool(feed_state_save(id, fs_status_make(now, published, errors, unread) + "\n" + body))
+    rho_unlock("feed-refresh")
+    if errors != "" {
+        warn("feed", "feed " + id + ": " + errors)
+    }
+    return errors
+}
+
+// feed_refresh_item reads one source and answers its lines of the new state:
+// its last reading and, for an item with history, its points in the window.
+// @req FEED-0002, FEED-0004
+fn feed_refresh_item(item: string, source: string, old: string, now: u32) string {
+    let last: string = fs_last(old, source)
+    let reading: string = feed_read_item(item, now)
+    var out: string = ""
+    var at: u32 = 0
+    var value: string = ""
+    if reading != "" {
+        at = int_from_str(str_field(reading, "|", 0))
+        value = str_url_decode(str_field(reading, "|", 1))
+        out = fs_last_make(source, at, value, true) + "\n"
+    } else {
+        // Unreadable: the last value is kept, with its own time, and marked as
+        // not read, which makes it stale (FEED-0004).
+        out = fs_last_make(source, fs_last_at(last), fs_last_value(last), false) + "\n"
+    }
+    let window: u32 = fd_history_seconds(fd_item_history(item))
+    if window == 0 {
+        return out
+    }
+    var since: u32 = 0
+    if now > window {
+        since = now - window
+    }
+    var points: string = ""
+    if !str_eq(fd_item_app(item), "mesh") {
+        // An appapi value has its history in its application.
+        points = feed_read_history(item, source, since, now)
+        if points == "" {
+            points = fs_points(old, source, since)
+        }
+    } else {
+        // Mesh's history is what Feed has read of it itself.
+        points = fs_points(old, source, since)
+        if reading != "" && milli_valid(value) {
+            points = points + fs_point_make(source, at, value) + "\n"
+        }
+    }
+    let count: u32 = fd_line_count(points)
+    if count > FEED_POINTS_KEPT {
+        // The oldest go first.
+        var drop: u32 = count - FEED_POINTS_KEPT
+        while drop > 0 {
+            let cut: i32 = str_index_of(points, "\n")
+            points = str_slice(points, u32(cut) + 1, strlen(points) - u32(cut) - 1)
+            drop = drop - 1
+        }
+    }
+    return out + points
+}
+
+// feed_addresses are what a snapshot must never hold of this machine: the
+// called applications' addresses, the workspace and the home folder, one per
+// line.
+fn feed_addresses() string {
+    var out: string = feed_dir() + "\n"
+    if strlen(feed_home()) > 1 {
+        out = out + feed_home() + "\n"
+    }
+    let calls: string = feed_calls()
+    var i: u32 = 0
+    while i <= fd_comma_count(calls) {
+        let app: string = str_trim(str_field(calls, ",", i))
+        i = i + 1
+        let url: string = feed_service_url(app)
+        if url != "" {
+            out = out + url + "\n" + str_trim_prefix(str_trim_prefix(url, "http://"), "https://") + "\n"
+        }
+    }
+    return out
+}
+
+// feed_tick refreshes every enabled feed whose interval has passed since its
+// last refresh, or that was never refreshed.
+fn feed_tick() void {
+    let now: u32 = rho_now_s()
+    var rest: string = fd_feed_ids(feed_text())
+    while rest != "" {
+        let at: i32 = str_index_of(rest, "\n")
+        let id: string = str_slice(rest, 0, u32(at))
+        rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        let feed: string = fd_feed_line(feed_text(), id)
+        if feed == "" || !fd_feed_enabled(feed) {
+            continue
+        }
+        let last: u32 = fs_status_refreshed(feed_state(id))
+        if last == 0 || now < last || now - last >= fd_feed_interval(feed) {
+            ignore_string(feed_refresh(id, false))
+        }
+    }
+}
+
+fn ignore_string(value: string) void {
+}

@@ -1,0 +1,40 @@
+//
+// @file storage.rho
+// @brief The host functions Feed and the modules it carries call: files, processes, the clock, the embedded assets, other services.
+//
+// @module feed
+// @project robohub-feed
+// @author Aurel Miron
+// @date 2026-11-20
+//
+// SPDX-License-Identifier: MIT
+//
+
+module feed
+
+// The application's own files, embedded at build time.
+extern fn rho_asset(module: string, path: string) string
+
+// The host functions the application and its modules use. Included rather than
+// imported so the generated SQL port sees the extern names it implements.
+extern fn rho_path_exists(path: string) bool
+extern fn rho_read_text(path: string) string
+extern fn rho_write_text(path: string, text: string) bool
+extern fn rho_write_secret(path: string, text: string) bool
+extern fn rho_sleep_ms(milliseconds: u32) void
+extern fn rho_exec_args(program: string, arguments: string, output_path: string) u32
+extern fn rho_now_s() u32
+extern fn rho_random_hex(bytes: u32) string
+extern fn rho_lock(name: string) void
+extern fn rho_unlock(name: string) void
+
+// Another application's answer, asked with a service token for its audience
+// and a scope (FEED-0002): the body of a 2xx answer, "" for anything else.
+extern fn rho_http_body(method: string, url: string, body: string, content_type: string,
+    audience: string, scopes: string) string
+
+fn ignore_u32(value: u32) void {
+}
+
+fn ignore_bool(value: bool) void {
+}

@@ -1,0 +1,331 @@
+//
+// @file json.rho
+// @brief Reading a few values out of a small JSON answer, and writing a JSON string, without a tree.
+//
+// @module feed.domain.json
+// @project robohub-feed
+// @author Aurel Miron
+// @date 2026-11-20
+//
+// SPDX-License-Identifier: MIT
+//
+
+module feed.domain.json
+
+// What Mesh and an application's appapi answer is small JSON: a list of
+// projects, a list of sources, a value with its time, a list of points. Feed
+// reads exactly that and nothing more — the raw text of an object's member, a
+// string's text, the items of a list — the way Mesh's own reader does
+// (robohub-mesh src/mesh/domain/json_read.rho). A document it cannot read
+// answers "" rather than a guess.
+//
+// fj_quote writes a JSON string. It is the feed's own rather than the
+// service's json_string so the snapshot builder, which uses it, is plain Rho
+// and is tested on the C backend with the other rules.
+
+// fj_ws is the first position at or after `at` that is not white space.
+fn fj_ws(text: string, at: u32) u32 {
+    var i: u32 = at
+    let n: u32 = strlen(text)
+    while i < n {
+        let c: u8 = str_at(text, i)
+        if c != 32 && c != 10 && c != 9 && c != 13 {
+            return i
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// fj_value_end is the position just past the value that starts at `start`: a
+// string with its escapes, an object or a list with everything nested in it, or
+// a number, true, false or null.
+fn fj_value_end(text: string, start: u32) u32 {
+    let n: u32 = strlen(text)
+    var i: u32 = start
+    if i >= n {
+        return n
+    }
+    let first: u8 = str_at(text, i)
+    if first == 34 {
+        i = i + 1
+        while i < n {
+            let c: u8 = str_at(text, i)
+            if c == 92 {
+                i = i + 2
+                continue
+            }
+            if c == 34 {
+                return i + 1
+            }
+            i = i + 1
+        }
+        return n
+    }
+    if first == 123 || first == 91 {
+        var depth: u32 = 0
+        var quoted: bool = false
+        while i < n {
+            let c: u8 = str_at(text, i)
+            if quoted {
+                if c == 92 {
+                    i = i + 2
+                    continue
+                }
+                if c == 34 {
+                    quoted = false
+                }
+            } else if c == 34 {
+                quoted = true
+            } else if c == 123 || c == 91 {
+                depth = depth + 1
+            } else if c == 125 || c == 93 {
+                depth = depth - 1
+                if depth == 0 {
+                    return i + 1
+                }
+            }
+            i = i + 1
+        }
+        return n
+    }
+    while i < n {
+        let c: u8 = str_at(text, i)
+        if c == 44 || c == 125 || c == 93 || c == 32 || c == 10 || c == 9 || c == 13 {
+            return i
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// fj_text is a value as text: a string without its quotes and with its escapes
+// read (a \u escape as the UTF-8 of its character; one that is not hex, or a
+// lone surrogate, as U+FFFD), "" for null, and a number, true or false as
+// written.
+fn fj_text(raw: string) string {
+    let value: string = str_trim(raw)
+    if value == "null" {
+        return ""
+    }
+    let n: u32 = strlen(value)
+    if n < 2 || str_at(value, 0) != 34 || str_at(value, n - 1) != 34 {
+        return value
+    }
+    var out: string = ""
+    var i: u32 = 1
+    while i < n - 1 {
+        let c: string = str_slice(value, i, 1)
+        if c == "\\" && i + 1 < n - 1 {
+            let e: string = str_slice(value, i + 1, 1)
+            if e == "n" {
+                out = out + "\n"
+            } else if e == "t" {
+                out = out + "\t"
+            } else if e == "r" {
+                out = out + "\r"
+            } else if e == "u" && i + 5 < n {
+                // \uXXXX, and a surrogate pair \uD8XX\uDCXX, as UTF-8.
+                var cp: u32 = fj_hex4(value, i + 2)
+                var used: u32 = 6
+                if cp >= 55296 && cp <= 56319 && i + 11 < n && str_slice(value, i + 6, 2) == "\\u" {
+                    let low: u32 = fj_hex4(value, i + 8)
+                    if low >= 56320 && low <= 57343 {
+                        cp = 65536 + (cp - 55296) * 1024 + (low - 56320)
+                        used = 12
+                    }
+                }
+                out = out + fj_utf8(cp)
+                i = i + used
+                continue
+            } else {
+                out = out + e
+            }
+            i = i + 2
+            continue
+        }
+        out = out + c
+        i = i + 1
+    }
+    return out
+}
+
+// fj_hex4 is the four hexadecimal digits at a position as a number, or 65533
+// (U+FFFD) when they are not four hexadecimal digits.
+fn fj_hex4(text: string, at: u32) u32 {
+    var out: u32 = 0
+    var k: u32 = 0
+    while k < 4 {
+        let c: u8 = str_at(text, at + k)
+        var d: u32 = 0
+        if c >= 48 && c <= 57 {
+            d = u32(c) - 48
+        } else if c >= 97 && c <= 102 {
+            d = u32(c) - 87
+        } else if c >= 65 && c <= 70 {
+            d = u32(c) - 55
+        } else {
+            return 65533
+        }
+        out = out * 16 + d
+        k = k + 1
+    }
+    return out
+}
+
+// fj_utf8 is a character as UTF-8; a lone surrogate is U+FFFD.
+fn fj_utf8(code: u32) string {
+    var cp: u32 = code
+    if cp >= 55296 && cp <= 57343 {
+        cp = 65533
+    }
+    if cp < 128 {
+        return str_from_byte(u8(cp))
+    }
+    if cp < 2048 {
+        return str_from_byte(u8(192 + cp / 64)) + str_from_byte(u8(128 + cp % 64))
+    }
+    if cp < 65536 {
+        return str_from_byte(u8(224 + cp / 4096)) + str_from_byte(u8(128 + (cp / 64) % 64)) +
+            str_from_byte(u8(128 + cp % 64))
+    }
+    return str_from_byte(u8(240 + cp / 262144)) + str_from_byte(u8(128 + (cp / 4096) % 64)) +
+        str_from_byte(u8(128 + (cp / 64) % 64)) + str_from_byte(u8(128 + cp % 64))
+}
+
+// fj_member is the raw text of an object's own member (not one nested deeper),
+// or "" when the document is not an object or has no such member.
+fn fj_member(object: string, key: string) string {
+    let n: u32 = strlen(object)
+    var i: u32 = fj_ws(object, 0)
+    if i >= n || str_at(object, i) != 123 {
+        return ""
+    }
+    i = i + 1
+    while i < n {
+        i = fj_ws(object, i)
+        if i >= n || str_at(object, i) != 34 {
+            return ""
+        }
+        let key_end: u32 = fj_value_end(object, i)
+        let name: string = fj_text(str_slice(object, i, key_end - i))
+        i = fj_ws(object, key_end)
+        if i >= n || str_at(object, i) != 58 {
+            return ""
+        }
+        i = fj_ws(object, i + 1)
+        let value_end: u32 = fj_value_end(object, i)
+        if value_end <= i {
+            return ""
+        }
+        if str_eq(name, key) {
+            return str_slice(object, i, value_end - i)
+        }
+        i = fj_ws(object, value_end)
+        if i < n && str_at(object, i) == 44 {
+            i = i + 1
+        } else {
+            return ""
+        }
+    }
+    return ""
+}
+
+// fj_get is an object's member as text: a string's text, a number as written.
+fn fj_get(object: string, key: string) string {
+    return fj_text(fj_member(object, key))
+}
+
+// fj_items are the items of a list, one raw item per line. A line break in a
+// JSON document is only ever white space between tokens, never inside a string,
+// so each item is put on one line by making its line breaks spaces.
+fn fj_items(list: string) string {
+    let n: u32 = strlen(list)
+    var i: u32 = fj_ws(list, 0)
+    if i >= n || str_at(list, i) != 91 {
+        return ""
+    }
+    i = i + 1
+    var out: string = ""
+    while i < n {
+        i = fj_ws(list, i)
+        if i >= n || str_at(list, i) == 93 {
+            return out
+        }
+        let end: u32 = fj_value_end(list, i)
+        if end <= i {
+            return out
+        }
+        out = out + str_replace(str_replace(str_slice(list, i, end - i), "\n", " "), "\r", " ") + "\n"
+        i = fj_ws(list, end)
+        if i < n && str_at(list, i) == 44 {
+            i = i + 1
+        } else {
+            return out
+        }
+    }
+    return out
+}
+
+// fj_hex is one hexadecimal digit.
+fn fj_hex(n: u32) string {
+    return str_slice("0123456789abcdef", n, 1)
+}
+
+// fj_quote is text as a JSON string literal: quotes, backslashes and every
+// control character escaped, so free text cannot break the document.
+fn fj_quote(value: string) string {
+    var out: string = "\""
+    let n: u32 = strlen(value)
+    var start: u32 = 0
+    var i: u32 = 0
+    while i < n {
+        let c: u8 = str_at(value, i)
+        var escaped: string = ""
+        if c == 34 {
+            escaped = "\\\""
+        } else if c == 92 {
+            escaped = "\\\\"
+        } else if c == 10 {
+            escaped = "\\n"
+        } else if c == 13 {
+            escaped = "\\r"
+        } else if c == 9 {
+            escaped = "\\t"
+        } else if c < 32 || c == 127 {
+            escaped = "\\u00" + fj_hex(u32(c) / 16) + fj_hex(u32(c) % 16)
+        }
+        if escaped != "" {
+            out = out + str_slice(value, start, i - start) + escaped
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out + str_slice(value, start, n - start) + "\""
+}
+
+// fj_line is the line at `index` (from 0) of a newline-separated list, "" past
+// the end.
+fn fj_line(text: string, index: u32) string {
+    return str_field(text, "\n", index)
+}
+
+// fj_count is how many non-empty lines a newline-separated list has.
+fn fj_count(text: string) u32 {
+    var n: u32 = 0
+    var rest: string = text
+    while rest != "" {
+        let at: i32 = str_index_of(rest, "\n")
+        var line: string = rest
+        if at < 0 {
+            rest = ""
+        } else {
+            line = str_slice(rest, 0, u32(at))
+            rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        }
+        if line != "" {
+            n = n + 1
+        }
+    }
+    return n
+}

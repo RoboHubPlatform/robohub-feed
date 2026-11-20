@@ -1,0 +1,56 @@
+//
+// @file access.rho
+// @brief What a person signed in may do in Feed, as a rule over the verified audience and scopes.
+//
+// @module feed.domain.access
+// @project robohub-feed
+// @author Aurel Miron
+// @date 2026-11-20
+//
+// SPDX-License-Identifier: MIT
+//
+
+module feed.domain.access
+
+// The keeper grants a person `feed:*` (change feeds and publishers) or
+// `feed:read` (look), or everything (`*`). The auth middleware verifies the
+// ticket and sets X-Rho-Aud and X-Rho-Scopes from it alone, and already refuses
+// a change from someone whose grants all end in `:read`; this rule is asked by
+// every page and form as well, so a route the middleware were ever to leave
+// unguarded is refused here rather than served. No audience is nobody, no
+// scopes is no grant — the shape of Mesh's mesh_grant.
+
+// fa_listed is whether a comma-separated list of scopes holds a scope.
+fn fa_listed(scopes: string, wanted: string) bool {
+    var rest: string = scopes
+    while rest != "" {
+        let at: i32 = str_index_of(rest, ",")
+        var token: string = rest
+        if at < 0 {
+            rest = ""
+        } else {
+            token = str_slice(rest, 0, u32(at))
+            rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        }
+        if str_eq(str_trim(token), wanted) {
+            return true
+        }
+    }
+    return false
+}
+
+// fa_grant is whether a principal may look (`write` false) or change (`write`
+// true) what Feed keeps (FEED-0007).
+// @req FEED-0007
+fn fa_grant(audience: string, scopes: string, write: bool) bool {
+    if audience == "" || scopes == "" {
+        return false
+    }
+    if fa_listed(scopes, "*") || fa_listed(scopes, "feed:*") {
+        return true
+    }
+    if write {
+        return false
+    }
+    return fa_listed(scopes, "feed:read")
+}

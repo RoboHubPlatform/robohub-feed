@@ -1,0 +1,387 @@
+//
+// @file snapshot.rho
+// @brief A feed's snapshot: times in UTC, staleness, values, history, the JSON itself and the check that nothing internal is in it.
+//
+// @module feed.domain.snapshot
+// @project robohub-feed
+// @author Aurel Miron
+// @date 2026-11-20
+//
+// SPDX-License-Identifier: MIT
+//
+
+module feed.domain.snapshot
+
+// What a refresh publishes for one feed (FEED-0003):
+//
+//   {"format":"robohub-feed","schema":1,"id":"…","title":"…",
+//    "updated_at":"2026-11-20T10:00:00Z","refresh":60,
+//    "items":[{"key":"i1","label":"…","value":21.5,"unit":"°C",
+//              "at":"2026-11-20T09:59:58Z","stale":false,
+//              "history":[["2026-11-20T09:00:00Z",21.1],…]}]}
+//
+// Everything in it is what the person chose to make public — the feed's title,
+// each item's label and unit — and what was read: values and their times. An
+// item's key is its position (`i1`, `i2` …), never the source it reads; the
+// application, project, node and source of a reading stay in the workspace.
+//
+// What the application remembers between refreshes is a state file per feed:
+//
+//   status|<last refresh>|<last publish>|<error>|<readings not current>
+//   last|<source id>|<taken at>|<value>|<1 read at the last refresh, 0 not>
+//   point|<source id>|<taken at>|<value>
+//
+// Nothing here reads a file or the clock: `now` is always given.
+
+// The most points an item's history carries: enough for a sparkline, and a
+// snapshot that stays small whatever the window.
+const FS_HISTORY_POINTS: u32 = 96
+
+// The shortest time after which a reading is stale, whatever the interval
+// (FEED-0004).
+const FS_STALE_FLOOR: u32 = 300
+
+/* -------------------------------------------------------------------------- */
+/*  Time                                                                      */
+/* -------------------------------------------------------------------------- */
+
+fn fs_two(n: u32) string {
+    if n < 10 {
+        return "0" + int_to_str(n)
+    }
+    return int_to_str(n)
+}
+
+// fs_iso is a Unix time as UTC in ISO 8601, `2026-11-20T10:00:00Z` (FEED-0003).
+// The date is worked out from the day count by the civil-from-days rule, so it
+// needs no time zone and no library.
+// @req FEED-0003
+fn fs_iso(epoch: u32) string {
+    let days: u32 = epoch / 86400
+    let secs: u32 = epoch % 86400
+    // Days since 0000-03-01, in 400-year eras (all of them positive here).
+    let z: u32 = days + 719468
+    let era: u32 = z / 146097
+    let doe: u32 = z - era * 146097
+    let yoe: u32 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    var year: u32 = yoe + era * 400
+    let doy: u32 = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp: u32 = (5 * doy + 2) / 153
+    let day: u32 = doy - (153 * mp + 2) / 5 + 1
+    var month: u32 = mp + 3
+    if mp >= 10 {
+        month = mp - 9
+    }
+    if month <= 2 {
+        year = year + 1
+    }
+    return int_to_str(year) + "-" + fs_two(month) + "-" + fs_two(day) + "T" +
+        fs_two(secs / 3600) + ":" + fs_two((secs % 3600) / 60) + ":" + fs_two(secs % 60) + "Z"
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Staleness                                                                 */
+/* -------------------------------------------------------------------------- */
+
+// fs_stale_after is how old a reading may be before it is stale: three refresh
+// intervals or 5 minutes, whichever is longer (FEED-0004).
+// @req FEED-0004
+fn fs_stale_after(interval: u32) u32 {
+    let three: u32 = interval * 3
+    if three > FS_STALE_FLOOR {
+        return three
+    }
+    return FS_STALE_FLOOR
+}
+
+// fs_is_stale is whether an item is published as stale: its source could not
+// be read at the last refresh (`read` false), it was never read (`at` 0), or
+// its reading is older than fs_stale_after. A reading from the future, a clock
+// that moved, is not stale.
+// @req FEED-0004
+fn fs_is_stale(at: u32, now: u32, interval: u32, read: bool) bool {
+    if !read || at == 0 {
+        return true
+    }
+    if at >= now {
+        return false
+    }
+    return now - at > fs_stale_after(interval)
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Values                                                                    */
+/* -------------------------------------------------------------------------- */
+
+// fs_value_json is a reading as a snapshot carries it: a number when it is one
+// (to the item's decimals, or as read to the thousandth), a string for a word
+// state such as `on`, and null when there is no reading yet.
+// @req FEED-0003
+fn fs_value_json(value: string, decimals: string) string {
+    let v: string = str_trim(value)
+    if v == "" {
+        return "null"
+    }
+    if milli_valid(v) {
+        let milli: i64 = milli_parse(v)
+        if decimals == "" {
+            return milli_format(milli)
+        }
+        return milli_format_fixed(milli, int_from_str(decimals))
+    }
+    return fj_quote(v)
+}
+
+// fs_key is an item's key in a snapshot: its position, `i1` for the first.
+// @req FEED-0003
+fn fs_key(position: u32) string {
+    return "i" + int_to_str(position)
+}
+
+/* -------------------------------------------------------------------------- */
+/*  The state file                                                            */
+/* -------------------------------------------------------------------------- */
+
+fn fs_status_make(refreshed: u32, published: u32, error: string, unread: u32) string {
+    return "status|" + int_to_str(refreshed) + "|" + int_to_str(published) + "|" +
+        str_url_encode(error) + "|" + int_to_str(unread)
+}
+
+fn fs_last_make(source: string, at: u32, value: string, read: bool) string {
+    var ok: string = "0"
+    if read {
+        ok = "1"
+    }
+    return "last|" + source + "|" + int_to_str(at) + "|" + str_url_encode(value) + "|" + ok
+}
+
+fn fs_point_make(source: string, at: u32, value: string) string {
+    return "point|" + source + "|" + int_to_str(at) + "|" + str_url_encode(value)
+}
+
+// fs_first is the first line of `text` whose first two fields are `kind` and
+// `key` (any key when `key` is "").
+fn fs_first(text: string, kind: string, key: string) string {
+    var rest: string = text
+    while rest != "" {
+        let at: i32 = str_index_of(rest, "\n")
+        var line: string = rest
+        if at < 0 {
+            rest = ""
+        } else {
+            line = str_slice(rest, 0, u32(at))
+            rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        }
+        if str_eq(str_field(line, "|", 0), kind) && (key == "" || str_eq(str_field(line, "|", 1), key)) {
+            return line
+        }
+    }
+    return ""
+}
+
+fn fs_status(state: string) string {
+    return fs_first(state, "status", "")
+}
+
+fn fs_status_refreshed(state: string) u32 { return int_from_str(str_field(fs_status(state), "|", 1)) }
+fn fs_status_published(state: string) u32 { return int_from_str(str_field(fs_status(state), "|", 2)) }
+fn fs_status_error(state: string) string { return str_url_decode(str_field(fs_status(state), "|", 3)) }
+fn fs_status_unread(state: string) u32 { return int_from_str(str_field(fs_status(state), "|", 4)) }
+
+fn fs_last(state: string, source: string) string {
+    return fs_first(state, "last", source)
+}
+
+fn fs_last_at(line: string) u32 { return int_from_str(str_field(line, "|", 2)) }
+fn fs_last_value(line: string) string { return str_url_decode(str_field(line, "|", 3)) }
+fn fs_last_read(line: string) bool { return str_eq(str_field(line, "|", 4), "1") }
+
+// fs_points are a source's history points, oldest first, at or after `since`.
+fn fs_points(state: string, source: string, since: u32) string {
+    var out: string = ""
+    var rest: string = state
+    while rest != "" {
+        let at: i32 = str_index_of(rest, "\n")
+        var line: string = rest
+        if at < 0 {
+            rest = ""
+        } else {
+            line = str_slice(rest, 0, u32(at))
+            rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        }
+        if str_eq(str_field(line, "|", 0), "point") && str_eq(str_field(line, "|", 1), source) &&
+            int_from_str(str_field(line, "|", 2)) >= since {
+            out = out + line + "\n"
+        }
+    }
+    return out
+}
+
+// fs_thin is at most `max` of the lines, spread evenly, the last always kept.
+fn fs_thin(lines: string, max: u32) string {
+    let n: u32 = fd_line_count(lines)
+    if n <= max || max == 0 {
+        return lines
+    }
+    var out: string = ""
+    var k: u32 = 0
+    while k < max {
+        // The k-th of max picks, the last one landing on the last line.
+        let index: u32 = ((n - 1) * k) / (max - 1)
+        out = out + str_field(lines, "\n", index) + "\n"
+        k = k + 1
+    }
+    return out
+}
+
+/* -------------------------------------------------------------------------- */
+/*  The snapshot                                                              */
+/* -------------------------------------------------------------------------- */
+
+// fs_history_json is an item's history as `[time, value]` pairs: its numeric
+// points within the window, thinned to FS_HISTORY_POINTS.
+fn fs_history_json(state: string, source: string, since: u32, decimals: string) string {
+    var numeric: string = ""
+    var rest: string = fs_points(state, source, since)
+    while rest != "" {
+        let at: i32 = str_index_of(rest, "\n")
+        let line: string = str_slice(rest, 0, u32(at))
+        rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        if milli_valid(str_url_decode(str_field(line, "|", 3))) {
+            numeric = numeric + line + "\n"
+        }
+    }
+    var out: string = ""
+    rest = fs_thin(numeric, FS_HISTORY_POINTS)
+    while rest != "" {
+        let at: i32 = str_index_of(rest, "\n")
+        let line: string = str_slice(rest, 0, u32(at))
+        rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        if out != "" {
+            out = out + ","
+        }
+        out = out + "[" + fj_quote(fs_iso(int_from_str(str_field(line, "|", 2)))) + "," +
+            fs_value_json(str_url_decode(str_field(line, "|", 3)), decimals) + "]"
+    }
+    return "[" + out + "]"
+}
+
+// fs_item_json is one item of a snapshot: its key, label, value, unit, time and
+// whether it is stale, and its history when it has a window. Nothing of where
+// the reading came from is written.
+// @req FEED-0003, FEED-0004
+fn fs_item_json(item: string, position: u32, state: string, now: u32, interval: u32) string {
+    let source: string = fd_item_source(item)
+    let last: string = fs_last(state, source)
+    let at: u32 = fs_last_at(last)
+    let decimals: string = fd_item_decimals(item)
+    var when: string = "null"
+    if at > 0 {
+        when = fj_quote(fs_iso(at))
+    }
+    var stale: string = "false"
+    if fs_is_stale(at, now, interval, last != "" && fs_last_read(last)) {
+        stale = "true"
+    }
+    var out: string = "{\"key\":" + fj_quote(fs_key(position)) +
+        ",\"label\":" + fj_quote(fd_item_label(item)) +
+        ",\"value\":" + fs_value_json(fs_last_value(last), decimals) +
+        ",\"unit\":" + fj_quote(fd_item_unit(item)) +
+        ",\"at\":" + when +
+        ",\"stale\":" + stale
+    let window: u32 = fd_history_seconds(fd_item_history(item))
+    if window > 0 {
+        var since: u32 = 0
+        if now > window {
+            since = now - window
+        }
+        out = out + ",\"history\":" + fs_history_json(state, source, since, decimals)
+    }
+    return out + "}"
+}
+
+// fs_snapshot is one feed's snapshot at `now`, from its items and what the
+// state remembers of their readings (FEED-0003).
+// @req FEED-0003
+fn fs_snapshot(feed: string, items: string, state: string, now: u32) string {
+    let interval: u32 = fd_feed_interval(feed)
+    var list: string = ""
+    var position: u32 = 1
+    let n: u32 = fd_line_count(items)
+    while position <= n {
+        if list != "" {
+            list = list + ","
+        }
+        list = list + fs_item_json(fd_item_at(items, position), position, state, now, interval)
+        position = position + 1
+    }
+    return "{\"format\":\"robohub-feed\",\"schema\":1" +
+        ",\"id\":" + fj_quote(fd_feed_id(feed)) +
+        ",\"title\":" + fj_quote(fd_feed_title(feed)) +
+        ",\"updated_at\":" + fj_quote(fs_iso(now)) +
+        ",\"refresh\":" + int_to_str(interval) +
+        ",\"items\":[" + list + "]}\n"
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Nothing internal leaves                                                   */
+/* -------------------------------------------------------------------------- */
+
+// The words a snapshot is made of whatever the feed: its keys and literals.
+const FS_VOCABULARY: string = "format robohub-feed schema id title updated_at refresh items key label value unit at stale history true false null"
+
+// fs_chosen is everything a snapshot may say that the person chose or that was
+// read: the vocabulary, the feed's id and title, and each item's label, unit
+// and last value.
+fn fs_chosen(feed: string, items: string, state: string) string {
+    var out: string = FS_VOCABULARY + "\n" + fd_feed_id(feed) + "\n" + fd_feed_title(feed) + "\n"
+    var rest: string = items
+    while rest != "" {
+        let at: i32 = str_index_of(rest, "\n")
+        let line: string = str_slice(rest, 0, u32(at))
+        rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        out = out + fd_item_label(line) + "\n" + fd_item_unit(line) + "\n" +
+            fs_last_value(fs_last(state, fd_item_source(line))) + "\n"
+    }
+    return out
+}
+
+// fs_internal are what must never be in a snapshot: each item's application,
+// project, source or value id, and the given addresses (one per line) — the
+// applications' URLs, the workspace — with the marks of an address or a token.
+fn fs_internal(items: string, addresses: string) string {
+    var out: string = addresses + "\nhttp://\nhttps://\nBearer \n"
+    var rest: string = items
+    while rest != "" {
+        let at: i32 = str_index_of(rest, "\n")
+        let line: string = str_slice(rest, 0, u32(at))
+        rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        out = out + fd_item_app(line) + "\n" + fd_item_ref(line) + "\n" + fd_item_sub(line) + "\n"
+    }
+    return out
+}
+
+// fs_leak is the first of the `internal` strings (one per line, three
+// characters or more) that a snapshot holds although none of the `chosen` texts
+// does, or "" when there is none. The snapshot is built from chosen texts and
+// readings alone, so this finds nothing unless the builder is wrong; it is the
+// check a refresh makes before anything is handed to a publisher, and a
+// snapshot it refuses is not published (FEED-0003).
+// @req FEED-0003
+fn fs_leak(snapshot: string, internal: string, chosen: string) string {
+    var rest: string = internal
+    while rest != "" {
+        let at: i32 = str_index_of(rest, "\n")
+        var needle: string = rest
+        if at < 0 {
+            rest = ""
+        } else {
+            needle = str_slice(rest, 0, u32(at))
+            rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        }
+        if strlen(needle) >= 3 && str_contains(snapshot, needle) && !str_contains(chosen, needle) {
+            return needle
+        }
+    }
+    return ""
+}

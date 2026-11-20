@@ -1,0 +1,160 @@
+//
+// @file publish.rho
+// @brief Publishers as rules: which kinds exist, which folders a directory publisher may write to, and the names of what it writes.
+//
+// @module feed.domain.publish
+// @project robohub-feed
+// @author Aurel Miron
+// @date 2026-11-20
+//
+// SPDX-License-Identifier: MIT
+//
+
+module feed.domain.publish
+
+// A publisher receives the files of one refresh — each enabled feed's snapshot
+// and widget.js — and puts each in place atomically (FEED-0006). The kinds are
+// pluggable; `directory`, a folder on this machine, is the only one that
+// exists, and a publisher of any other kind is refused until it does (robohub
+// ADR-0019 leaves where the files are hosted to later decisions, each about the
+// credential its kind needs).
+//
+// A directory publisher writes where the person says, so where that may be is a
+// rule: an absolute, plain path (no `.` or `..` part, no empty part, nothing
+// that is not printable), not the root or a system folder, not the home folder
+// itself, and no hidden folder on the way — which keeps ~/.rho (the keeper's
+// keys, the registry), ~/.ssh and ~/.config out of reach — except inside the
+// application's own workspace, where its default publisher writes.
+
+// fp_kind_exists is whether a publisher kind is one the application has.
+// @req FEED-0006
+fn fp_kind_exists(kind: string) bool {
+    return str_eq(kind, "directory")
+}
+
+// fp_kind_planned is whether a kind is one robohub ADR-0019 names for later
+// (git, ssh, s3): offered on the page as not available yet, and refused.
+fn fp_kind_planned(kind: string) bool {
+    return str_eq(kind, "git") || str_eq(kind, "ssh") || str_eq(kind, "s3")
+}
+
+// fp_trim_slash is a path without the slashes it ends with ("/" stays "/").
+fn fp_trim_slash(path: string) string {
+    var p: string = path
+    while strlen(p) > 1 && str_at(p, strlen(p) - 1) == 47 {
+        p = str_slice(p, 0, strlen(p) - 1)
+    }
+    return p
+}
+
+// fp_under is whether a path is a folder or inside it.
+fn fp_under(path: string, folder: string) bool {
+    if folder == "" {
+        return false
+    }
+    return str_eq(path, folder) || str_starts_with(path, folder + "/")
+}
+
+// The folders of the system a publisher never writes into.
+const FP_SYSTEM: string = "/bin,/boot,/dev,/etc,/lib,/lib32,/lib64,/proc,/root,/run,/sbin,/sys,/usr,/var/lib,/var/log"
+
+// fp_dir_ok is whether a directory publisher may write into a folder, given the
+// home folder and the application's workspace (FEED-0006).
+// @req FEED-0006
+fn fp_dir_ok(path: string, home: string, workspace: string) bool {
+    let raw: string = path
+    let n: u32 = strlen(raw)
+    if n < 2 || n > 512 || str_at(raw, 0) != 47 {
+        return false
+    }
+    var i: u32 = 0
+    while i < n {
+        let c: u8 = str_at(raw, i)
+        if c < 32 || c == 127 || c == 124 || c == 92 {
+            return false
+        }
+        i = i + 1
+    }
+    let p: string = fp_trim_slash(raw)
+    if str_eq(p, "/") || str_contains(p, "//") {
+        return false
+    }
+    // Every part after the first slash: none empty, none `.` or `..`, and none
+    // hidden outside the workspace.
+    let ws: string = fp_trim_slash(workspace)
+    let inside: bool = strlen(ws) > 1 && fp_under(p, ws) && !str_eq(p, ws)
+    var k: u32 = 1
+    while true {
+        let part: string = str_field(p, "/", k)
+        if part == "" {
+            break
+        }
+        if str_eq(part, ".") || str_eq(part, "..") {
+            return false
+        }
+        if str_at(part, 0) == 46 && !inside {
+            return false
+        }
+        k = k + 1
+    }
+    if inside {
+        return true
+    }
+    var s: u32 = 0
+    while true {
+        let system: string = str_field(FP_SYSTEM, ",", s)
+        if system == "" {
+            break
+        }
+        if fp_under(p, system) {
+            return false
+        }
+        s = s + 1
+    }
+    let h: string = fp_trim_slash(home)
+    if strlen(h) > 1 && str_eq(p, h) {
+        return false
+    }
+    return true
+}
+
+// fp_snapshot_path is where a feed's snapshot is in a publisher's folder:
+// `feeds/<id>.json`. The id has been checked to be hexadecimal, so it cannot
+// name anything else.
+// @req FEED-0003, FEED-0006
+fn fp_snapshot_path(folder: string, id: string) string {
+    return fp_trim_slash(folder) + "/feeds/" + id + ".json"
+}
+
+fn fp_widget_path(folder: string) string {
+    return fp_trim_slash(folder) + "/widget.js"
+}
+
+fn fp_example_path(folder: string) string {
+    return fp_trim_slash(folder) + "/example.html"
+}
+
+// fp_temp_path is the file a publisher writes before renaming it into place:
+// beside the target, in the same folder (so the rename is one step), hidden and
+// unique.
+// @req FEED-0006
+fn fp_temp_path(target: string, unique: string) string {
+    let slash: i32 = fp_last_slash(target)
+    if slash < 0 {
+        return "." + target + "." + unique + ".tmp"
+    }
+    let dir: string = str_slice(target, 0, u32(slash))
+    let name: string = str_slice(target, u32(slash) + 1, strlen(target) - u32(slash) - 1)
+    return dir + "/." + name + "." + unique + ".tmp"
+}
+
+fn fp_last_slash(path: string) i32 {
+    var i: u32 = strlen(path)
+    while i > 0 {
+        i = i - 1
+        if str_at(path, i) == 47 {
+            return i32(i)
+        }
+    }
+    return -1
+}

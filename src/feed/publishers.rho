@@ -1,0 +1,122 @@
+//
+// @file publishers.rho
+// @brief The publishers: handing the files of a refresh to each of a feed's publishers, and taking a snapshot back when a feed goes.
+//
+// @module feed
+// @project robohub-feed
+// @author Aurel Miron
+// @date 2026-11-20
+//
+// SPDX-License-Identifier: MIT
+//
+
+module feed
+
+// A publisher receives the files of one refresh — the feed's snapshot and
+// widget.js, with a small example.html — and puts each in place atomically
+// (FEED-0006). The `directory` publisher writes each file beside its target
+// under a hidden temporary name and renames it over the target, so a web server
+// or a sync tool serving the folder never reads half a file. A publisher of a
+// kind that does not exist yet, or a folder the rules refuse, is a failure with
+// its reason, and the next refresh tries again.
+
+// feed_publish hands one feed's snapshot to each of its publishers and answers
+// their failures, "; "-separated, or "" when every one succeeded.
+// @req FEED-0006
+fn feed_publish(text: string, feed: string, snapshot: string) string {
+    let names: string = fd_feed_publishers(feed)
+    var errors: string = ""
+    var i: u32 = 0
+    while i <= fd_comma_count(names) {
+        let name: string = str_trim(str_field(names, ",", i))
+        i = i + 1
+        if name == "" {
+            continue
+        }
+        let failed: string = feed_publish_to(fd_publisher_line(text, name), name, fd_feed_id(feed), snapshot)
+        if failed != "" {
+            if errors != "" {
+                errors = errors + "; "
+            }
+            errors = errors + name + ": " + failed
+        }
+    }
+    if str_trim(names) == "" {
+        return "the feed has no publisher"
+    }
+    return errors
+}
+
+// feed_publish_to is one publisher's part: "" when its files are in place, or
+// why they are not.
+// @req FEED-0005, FEED-0006
+fn feed_publish_to(publisher: string, name: string, id: string, snapshot: string) string {
+    if publisher == "" {
+        return "no such publisher"
+    }
+    let kind: string = fd_publisher_kind(publisher)
+    if !fp_kind_exists(kind) {
+        return "publishers of kind " + kind + " do not exist yet"
+    }
+    let folder: string = fd_publisher_target(publisher)
+    if !fp_dir_ok(folder, feed_home(), feed_dir()) {
+        return "the folder " + folder + " is not one a publisher may write to"
+    }
+    var failed: string = feed_put(fp_widget_path(folder), rho_asset("feed", "static/widget.js"))
+    if failed == "" {
+        failed = feed_put(fp_example_path(folder), rho_asset("feed", "static/example.html"))
+    }
+    if failed == "" {
+        failed = feed_put(fp_snapshot_path(folder, id), snapshot)
+    }
+    return failed
+}
+
+// feed_put puts one file in place: written beside it, then renamed over it.
+// @req FEED-0006
+fn feed_put(target: string, content: string) string {
+    if content == "" {
+        return "nothing to write to " + target
+    }
+    let slash: i32 = fp_last_slash(target)
+    if slash > 0 && !feed_mkdir(str_slice(target, 0, u32(slash))) {
+        return "could not make the folder of " + target
+    }
+    let unique: string = rho_random_hex(6)
+    if unique == "" {
+        return "no random source"
+    }
+    let temporary: string = fp_temp_path(target, unique)
+    if !rho_write_text(temporary, content) {
+        ignore_u32(rho_exec_args("rm", "-f\n" + temporary + "\n", "/dev/null"))
+        return "could not write " + target
+    }
+    if rho_exec_args("mv", "-f\n" + temporary + "\n" + target + "\n", "/dev/null") != 0 {
+        ignore_u32(rho_exec_args("rm", "-f\n" + temporary + "\n", "/dev/null"))
+        return "could not rename into " + target
+    }
+    return ""
+}
+
+// feed_unpublish takes a feed's snapshot back from the directory publishers
+// named (a comma-separated list): when the feed is deleted, or a publisher is
+// taken off it (FEED-0007).
+// @req FEED-0007
+fn feed_unpublish(text: string, id: string, names: string) void {
+    if !fd_id_ok(id) {
+        return
+    }
+    var i: u32 = 0
+    while i <= fd_comma_count(names) {
+        let name: string = str_trim(str_field(names, ",", i))
+        i = i + 1
+        let publisher: string = fd_publisher_line(text, name)
+        if publisher == "" || !str_eq(fd_publisher_kind(publisher), "directory") {
+            continue
+        }
+        let folder: string = fd_publisher_target(publisher)
+        if fp_dir_ok(folder, feed_home(), feed_dir()) {
+            ignore_u32(rho_exec_args("rm", "-f\n" + fp_snapshot_path(folder, id) + "\n", "/dev/null"))
+        }
+    }
+}

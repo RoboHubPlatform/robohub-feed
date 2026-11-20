@@ -1,0 +1,329 @@
+//
+// @file feed_test.rho
+// @brief The unit tests of Feed's rules: ids, intervals, staleness, the snapshot, the privacy check, publisher folders, grants.
+//
+// @module feed.tests
+// @project robohub-feed
+// @author Aurel Miron
+// @date 2026-11-20
+//
+// SPDX-License-Identifier: MIT
+//
+
+module feed.tests
+
+include "../src/feed/domain/json.rho"
+include "../src/feed/domain/model.rho"
+include "../src/feed/domain/snapshot.rho"
+include "../src/feed/domain/publish.rho"
+include "../src/feed/domain/access.rho"
+
+// None of the rules reads a file, the clock or another application, which is
+// what lets them be tested here rather than through the pages; the smoke test
+// (tests/feed_smoke.py) runs the application itself.
+
+extern fn abort()
+
+fn check(condition: bool, what: string) void {
+    if !condition {
+        print("FAIL: " + what + "\n")
+        abort()
+    }
+}
+
+fn same(got: string, wanted: string, what: string) void {
+    if !str_eq(got, wanted) {
+        print("FAIL: " + what + "\n  got:    " + got + "\n  wanted: " + wanted + "\n")
+        abort()
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*  The model                                                                 */
+/* -------------------------------------------------------------------------- */
+
+// @verifies FEED-0001
+test fn a_feed_id_is_sixteen_or_more_lowercase_hex() void {
+    check(fd_id_ok("0123456789abcdef"), "16 hex characters are an id")
+    check(fd_id_ok("0123456789abcdef01234567"), "24 are too")
+    check(!fd_id_ok("0123456789abcde"), "15 are not")
+    check(!fd_id_ok("0123456789ABCDEF"), "capitals are not")
+    check(!fd_id_ok("0123456789abcdeg"), "a letter past f is not")
+    check(!fd_id_ok("../../etc/passwd0"), "a path is not")
+    check(!fd_id_ok("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0"), "65 characters are too many")
+    check(!fd_id_ok(""), "nothing is not")
+    print("[PASS] a_feed_id_is_sixteen_or_more_lowercase_hex\n")
+}
+
+// @verifies FEED-0001
+test fn a_refresh_interval_is_thirty_seconds_at_least() void {
+    check(!fd_interval_ok(29), "29 s is too short")
+    check(fd_interval_ok(30), "30 s is the shortest")
+    check(fd_interval_ok(86400), "a day is the longest")
+    check(!fd_interval_ok(86401), "longer than a day is refused")
+    let text: string = fd_publisher_make("local", "directory", "/srv/www") + "\n"
+    same(fd_validate_feed("Garden", "29", "local", text), "feed.error.interval", "a form with 29 s is refused")
+    same(fd_validate_feed("Garden", "3O", "local", text), "feed.error.interval", "a form with a letter is refused")
+    same(fd_validate_feed("Garden", "-30", "local", text), "feed.error.interval", "a negative interval is refused")
+    same(fd_validate_feed("Garden", "30", "local", text), "", "30 s with a known publisher is taken")
+    same(fd_validate_feed("", "60", "local", text), "feed.error.title", "a feed needs a title")
+    same(fd_validate_feed("Garden", "60", "github", text), "feed.error.publisher", "a publisher that does not exist is refused")
+    print("[PASS] a_refresh_interval_is_thirty_seconds_at_least\n")
+}
+
+// @verifies FEED-0001
+test fn feeds_items_and_publishers_survive_the_file() void {
+    let p: string = fd_publisher_make("local", "directory", "/srv/www/robo hub") + "\n"
+    let feed: string = fd_feed_make("0123456789abcdef", "Garden | house\nsecond", 60, true, "local")
+    let item1: string = fd_item_make("0123456789abcdef", "Air", "mesh", "Home", "ba06f37ca34ba32c.temperature", "°C", "1", "24h")
+    let item2: string = fd_item_make("0123456789abcdef", "Pump", "aquarium", "pump.state", "", "", "", "none")
+    var text: string = fd_replace_feed(p, "0123456789abcdef", feed, item1 + "\n" + item2 + "\n")
+    let line: string = fd_feed_line(text, "0123456789abcdef")
+    same(fd_feed_title(line), "Garden | house\nsecond", "a title keeps its separators and line breaks")
+    check(fd_feed_interval(line) == 60 && fd_feed_enabled(line), "the interval and enabled are kept")
+    same(fd_feed_publishers(line), "local", "the publishers are kept")
+    let items: string = fd_items(text, "0123456789abcdef")
+    check(fd_line_count(items) == 2, "both items are kept")
+    same(fd_item_sub(fd_item_at(items, 1)), "ba06f37ca34ba32c.temperature", "the first item's source is kept")
+    same(fd_item_unit(fd_item_at(items, 1)), "°C", "its unit too")
+    same(fd_item_ref(fd_item_at(items, 2)), "pump.state", "the second is second")
+    same(fd_publisher_target(fd_publisher_line(text, "local")), "/srv/www/robo hub", "the publisher's folder is kept")
+    same(fd_feeds_using(text, "local"), "0123456789abcdef\n", "the feed names the publisher")
+    // A second feed after the first, then the first changed in place.
+    text = fd_replace_feed(text, "fedcba9876543210", fd_feed_make("fedcba9876543210", "Tank", 30, false, "local"), "")
+    text = fd_replace_feed(text, "0123456789abcdef", fd_feed_make("0123456789abcdef", "Garden", 90, true, "local"),
+        fd_items_without(items, 1))
+    same(fd_feed_ids(text), "0123456789abcdef\nfedcba9876543210\n", "a changed feed keeps its place")
+    check(fd_line_count(fd_items(text, "0123456789abcdef")) == 1, "the removed item is gone")
+    same(fd_item_label(fd_item_at(fd_items(text, "0123456789abcdef"), 1)), "Pump", "and the next is first")
+    text = fd_replace_feed(text, "0123456789abcdef", "", "")
+    same(fd_feed_ids(text), "fedcba9876543210\n", "a deleted feed is gone")
+    same(fd_items(text, "0123456789abcdef"), "", "with its items")
+    check(fd_publisher_line(text, "local") != "", "and the publisher stays")
+    text = fd_replace_publisher(text, "local", "")
+    same(fd_publisher_lines(text), "", "a publisher can be removed")
+    print("[PASS] feeds_items_and_publishers_survive_the_file\n")
+}
+
+// @verifies FEED-0001, FEED-0002
+test fn an_item_reads_only_from_an_application_the_manifest_calls() void {
+    let calls: string = "mesh,aquarium,energy"
+    same(fd_validate_item("Air", "mesh", "Home", "ba06.temperature", "°C", "1", "1h", calls), "", "a Mesh source is a project and a source")
+    same(fd_validate_item("Air", "mesh", "Home", "", "°C", "1", "1h", calls), "item.error.source", "a Mesh source needs both")
+    same(fd_validate_item("Pump", "aquarium", "pump.state", "", "", "", "none", calls), "", "an appapi value is its id")
+    same(fd_validate_item("Pump", "aquarium", "pump.state", "x", "", "", "none", calls), "item.error.source", "and nothing more")
+    same(fd_validate_item("Grid", "keeper", "x", "", "", "", "none", calls), "item.error.app", "the keeper is not called")
+    same(fd_validate_item("Air", "mesh", "Home/../x", "s", "", "", "none", calls), "item.error.source", "a path in a reference is refused")
+    same(fd_validate_item("", "mesh", "Home", "s", "", "", "none", calls), "item.error.label", "an item needs a label")
+    same(fd_validate_item("Air", "mesh", "Home", "s", "", "4", "none", calls), "item.error.decimals", "decimals are 0 to 3")
+    same(fd_validate_item("Air", "mesh", "Home", "s", "", "", "7d", calls), "item.error.history", "history is none, 1 h or 24 h")
+    check(fd_history_seconds("1h") == 3600 && fd_history_seconds("24h") == 86400 && fd_history_seconds("none") == 0, "the windows")
+    let manifest: string = "module:\n  name: feed\n\ndeploy:\n  port: 8484\n  # comment\n  calls: [mesh, aquarium,energy]\n\ndocs:\n  calls: [keeper]\n"
+    same(fd_manifest_calls(manifest), "mesh,aquarium,energy", "deploy.calls is read, and nothing after its block")
+    same(fd_manifest_calls("deploy:\n  port: 1\n"), "", "a manifest that calls nothing calls nothing")
+    same(fd_env_name("robohub-mqtt"), "ROBOHUB_MQTT", "the environment name of an application")
+    print("[PASS] an_item_reads_only_from_an_application_the_manifest_calls\n")
+}
+
+// @verifies FEED-0002
+test fn every_scope_asked_for_is_read_only() void {
+    same(fd_scope("mesh", "Home"), "mesh:Home:read", "a Mesh source is read with its project's read scope")
+    same(fd_scope("mesh", ""), "mesh:read", "Mesh's projects with Mesh's")
+    same(fd_scope("aquarium", "pump.state"), "aquarium:read", "an appapi value with its application's")
+    check(str_starts_with(str_slice(fd_scope("energy", "x"), strlen(fd_scope("energy", "x")) - 5, 5), ":read"), "never more")
+    print("[PASS] every_scope_asked_for_is_read_only\n")
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Staleness                                                                 */
+/* -------------------------------------------------------------------------- */
+
+// @verifies FEED-0004
+test fn a_reading_is_stale_after_three_intervals_or_five_minutes() void {
+    check(fs_stale_after(30) == 300, "30 s: five minutes is longer")
+    check(fs_stale_after(100) == 300, "100 s: three intervals are 300 s")
+    check(fs_stale_after(120) == 360, "120 s: three intervals are longer")
+    let now: u32 = 1794000000
+    check(!fs_is_stale(now - 300, now, 60, true), "a reading 300 s old is current at 60 s")
+    check(fs_is_stale(now - 301, now, 60, true), "301 s old is stale")
+    check(!fs_is_stale(now - 359, now, 120, true), "359 s old is current at 120 s")
+    check(fs_is_stale(now - 361, now, 120, true), "361 s old is stale at 120 s")
+    check(fs_is_stale(now, now, 60, false), "a source that could not be read is stale at once")
+    check(fs_is_stale(0, now, 60, true), "a source never read is stale")
+    check(!fs_is_stale(now + 30, now, 60, true), "a reading from a clock ahead is not")
+    print("[PASS] a_reading_is_stale_after_three_intervals_or_five_minutes\n")
+}
+
+/* -------------------------------------------------------------------------- */
+/*  The snapshot                                                              */
+/* -------------------------------------------------------------------------- */
+
+// @verifies FEED-0003
+test fn times_are_utc_iso_8601() void {
+    same(fs_iso(0), "1970-01-01T00:00:00Z", "the epoch")
+    same(fs_iso(951782400), "2000-02-29T00:00:00Z", "a leap day")
+    same(fs_iso(1794000000), "2026-11-06T21:20:00Z", "this year")
+    same(fs_iso(4102444799), "2099-12-31T23:59:59Z", "the century's last second")
+    print("[PASS] times_are_utc_iso_8601\n")
+}
+
+// @verifies FEED-0003
+test fn a_value_is_a_number_a_word_or_null() void {
+    same(fs_value_json("21.537", "1"), "21.5", "to the item's decimals")
+    same(fs_value_json("21.5", "2"), "21.50", "padded to them")
+    same(fs_value_json(" 21.50 ", ""), "21.5", "as read, to the thousandth")
+    same(fs_value_json("-3", ""), "-3", "a negative number")
+    same(fs_value_json("on", ""), "\"on\"", "a word state is a string")
+    same(fs_value_json("say \"hi\"\n", ""), "\"say \\\"hi\\\"\"", "a string is escaped")
+    same(fs_value_json("", "1"), "null", "no reading is null")
+    same(fs_key(3), "i3", "an item's key is its position")
+    same(fj_quote("a\tb" + str_from_byte(1)), "\"a\\tb\\u0001\"", "control characters are escaped")
+    print("[PASS] a_value_is_a_number_a_word_or_null\n")
+}
+
+fn sample_items() string {
+    return fd_item_make("0123456789abcdef", "Air", "mesh", "Greenhouse-7", "ba06f37ca34ba32c.temperature", "°C", "1", "1h") + "\n" +
+        fd_item_make("0123456789abcdef", "Pump", "aquarium", "pump.state", "", "", "", "none") + "\n" +
+        fd_item_make("0123456789abcdef", "Never", "energy", "grid.power", "", "W", "0", "none") + "\n"
+}
+
+fn sample_state(now: u32) string {
+    let air: string = fd_source_id("mesh", "Greenhouse-7", "ba06f37ca34ba32c.temperature")
+    let pump: string = fd_source_id("aquarium", "pump.state", "")
+    return fs_status_make(now, now, "", 1) + "\n" +
+        fs_last_make(air, now - 10, "21.537", true) + "\n" +
+        fs_point_make(air, now - 4000, "19") + "\n" +
+        fs_point_make(air, now - 1800, "20.04") + "\n" +
+        fs_point_make(air, now - 10, "21.537") + "\n" +
+        fs_last_make(pump, now - 400, "on", false) + "\n"
+}
+
+// @verifies FEED-0003, FEED-0004
+test fn a_snapshot_carries_labels_values_units_and_times() void {
+    let now: u32 = 1794000060
+    let feed: string = fd_feed_make("0123456789abcdef", "Garden \"west\"", 60, true, "local")
+    let got: string = fs_snapshot(feed, sample_items(), sample_state(now), now)
+    let wanted: string = "{\"format\":\"robohub-feed\",\"schema\":1,\"id\":\"0123456789abcdef\",\"title\":\"Garden \\\"west\\\"\"," +
+        "\"updated_at\":\"2026-11-06T21:21:00Z\",\"refresh\":60,\"items\":[" +
+        "{\"key\":\"i1\",\"label\":\"Air\",\"value\":21.5,\"unit\":\"°C\",\"at\":\"2026-11-06T21:20:50Z\",\"stale\":false," +
+        "\"history\":[[\"2026-11-06T20:51:00Z\",20.0],[\"2026-11-06T21:20:50Z\",21.5]]}," +
+        "{\"key\":\"i2\",\"label\":\"Pump\",\"value\":\"on\",\"unit\":\"\",\"at\":\"2026-11-06T21:14:20Z\",\"stale\":true}," +
+        "{\"key\":\"i3\",\"label\":\"Never\",\"value\":null,\"unit\":\"W\",\"at\":null,\"stale\":true}]}\n"
+    same(got, wanted, "the snapshot, exactly")
+    print("[PASS] a_snapshot_carries_labels_values_units_and_times\n")
+}
+
+// @verifies FEED-0003
+test fn nothing_internal_is_in_a_snapshot() void {
+    let now: u32 = 1794000060
+    let items: string = sample_items()
+    let state: string = sample_state(now)
+    let feed: string = fd_feed_make("0123456789abcdef", "Garden", 60, true, "local")
+    let snapshot: string = fs_snapshot(feed, items, state, now)
+    let internal: string = fs_internal(items, "http://127.0.0.1:8478\n/home/someone/.rho/keeper/workspaces/feed\n")
+    let chosen: string = fs_chosen(feed, items, state)
+    same(fs_leak(snapshot, internal, chosen), "", "the builder's snapshot holds nothing internal")
+    check(!str_contains(snapshot, "Greenhouse-7") && !str_contains(snapshot, "ba06f37ca34ba32c") &&
+        !str_contains(snapshot, "pump.state") && !str_contains(snapshot, "aquarium") && !str_contains(snapshot, "mesh"),
+        "no project, source, value id or application")
+    same(fs_leak(str_replace(snapshot, "\"Air\"", "\"Greenhouse-7\""), internal, chosen), "Greenhouse-7", "a project id is found")
+    same(fs_leak(snapshot + "http://127.0.0.1:8478/mesh", internal, chosen), "http://127.0.0.1:8478", "an address is found")
+    same(fs_leak(snapshot + "Bearer abc", internal, chosen), "Bearer ", "a token's mark is found")
+    // A label the person wrote may name what it likes: it is chosen text.
+    let named: string = fd_item_make("0123456789abcdef", "Mesh aquarium pump", "aquarium", "pump.state", "", "", "", "none") + "\n"
+    let named_snapshot: string = fs_snapshot(feed, named, "", now)
+    same(fs_leak(named_snapshot, fs_internal(named, ""), fs_chosen(feed, named, "")), "", "a chosen label is not a leak")
+    print("[PASS] nothing_internal_is_in_a_snapshot\n")
+}
+
+test fn a_history_is_thinned_evenly_keeping_the_last() void {
+    var lines: string = ""
+    var i: u32 = 0
+    while i < 10 {
+        lines = lines + int_to_str(i) + "\n"
+        i = i + 1
+    }
+    same(fs_thin(lines, 4), "0\n3\n6\n9\n", "four of ten, the last kept")
+    same(fs_thin(lines, 20), lines, "fewer than the most are kept as they are")
+    print("[PASS] a_history_is_thinned_evenly_keeping_the_last\n")
+}
+
+test fn small_json_answers_are_read() void {
+    let body: string = "{\"id\":\"pump.state\",\"value\":\"on\",\"nested\":{\"value\":\"no\"},\"updated_at\":1794000000}"
+    same(fj_get(body, "value"), "on", "an object's own member, not a nested one")
+    same(fj_get(body, "updated_at"), "1794000000", "a number as written")
+    let list: string = "[{\"id\":\"a\",\"name\":\"x, [y]\"}, {\"id\":\"b\"}]"
+    same(fj_items(list), "{\"id\":\"a\",\"name\":\"x, [y]\"}\n{\"id\":\"b\"}\n", "a list's items, one per line")
+    same(fj_get(fj_line(fj_items(list), 1), "id"), "b", "the second item")
+    same(fj_get("{\"n\":\"Bench \\u00b7 \\u00b0C \\ud83c\\udf3f\"}", "n"), "Bench · °C 🌿", "\\u escapes are read as UTF-8")
+    print("[PASS] small_json_answers_are_read\n")
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Publishers                                                                */
+/* -------------------------------------------------------------------------- */
+
+// @verifies FEED-0006
+test fn a_directory_publisher_writes_only_where_it_may() void {
+    let home: string = "/home/someone"
+    let ws: string = "/home/someone/.rho/keeper/workspaces/feed"
+    check(fp_dir_ok("/srv/www/robohub", home, ws), "a web server's folder")
+    check(fp_dir_ok("/home/someone/Sites/feed/", home, ws), "a folder in the home, its slash trimmed")
+    check(fp_dir_ok(ws + "/public", home, ws), "the default folder in the workspace")
+    check(!fp_dir_ok(ws, home, ws), "the workspace itself is not")
+    check(!fp_dir_ok("srv/www", home, ws), "a relative path is not")
+    check(!fp_dir_ok("/", home, ws), "the root is not")
+    check(!fp_dir_ok(home, home, ws), "the home folder itself is not")
+    check(!fp_dir_ok("/home/someone/.rho/keeper", home, ws), "the keeper's folder is not")
+    check(!fp_dir_ok("/home/someone/.config/systemd/user", home, ws), "a hidden folder is not")
+    check(!fp_dir_ok("/home/someone/.ssh", home, ws), "the SSH keys are not")
+    check(!fp_dir_ok("/srv/www/../../etc", home, ws), "a .. part is not")
+    check(!fp_dir_ok(ws + "/../../registry", home, ws), "not even from the workspace")
+    check(!fp_dir_ok("/srv/./www", home, ws), "a . part is not")
+    check(!fp_dir_ok("/srv//www", home, ws), "an empty part is not")
+    check(!fp_dir_ok("/etc/robohub", home, ws), "a system folder is not")
+    check(!fp_dir_ok("/usr/share/www", home, ws), "nor anything in one")
+    check(!fp_dir_ok("/srv/www\nx", home, ws), "a line break is not")
+    check(!fp_dir_ok("/srv/www|x", home, ws), "a field separator is not")
+    check(fp_kind_exists("directory") && !fp_kind_exists("git") && !fp_kind_exists(""), "only directory exists")
+    check(fp_kind_planned("git") && fp_kind_planned("ssh") && fp_kind_planned("s3"), "the later kinds are known")
+    same(fp_snapshot_path("/srv/www/", "0123456789abcdef"), "/srv/www/feeds/0123456789abcdef.json", "where a snapshot goes")
+    same(fp_temp_path("/srv/www/feeds/0123456789abcdef.json", "a1b2"), "/srv/www/feeds/.0123456789abcdef.json.a1b2.tmp",
+        "a file is written beside its target, hidden")
+    print("[PASS] a_directory_publisher_writes_only_where_it_may\n")
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Grants                                                                    */
+/* -------------------------------------------------------------------------- */
+
+// @verifies FEED-0007
+test fn feed_star_changes_and_feed_read_looks() void {
+    check(fa_grant("feed", "feed:*", true), "feed:* changes")
+    check(fa_grant("feed", "mesh:read, feed:*", true), "among other grants")
+    check(fa_grant("feed", "*", true), "everything changes")
+    check(fa_grant("feed", "feed:read", false), "feed:read looks")
+    check(!fa_grant("feed", "feed:read", true), "and does not change")
+    check(!fa_grant("feed", "mesh:*", false), "another application's grant does nothing")
+    check(!fa_grant("feed", "feed:reader", false), "a grant that only starts the same does nothing")
+    check(!fa_grant("", "feed:*", false), "no audience is nobody")
+    check(!fa_grant("feed", "", false), "no scopes is no grant")
+    print("[PASS] feed_star_changes_and_feed_read_looks\n")
+}
+
+fn main() void {
+    a_feed_id_is_sixteen_or_more_lowercase_hex()
+    a_refresh_interval_is_thirty_seconds_at_least()
+    feeds_items_and_publishers_survive_the_file()
+    an_item_reads_only_from_an_application_the_manifest_calls()
+    every_scope_asked_for_is_read_only()
+    a_reading_is_stale_after_three_intervals_or_five_minutes()
+    times_are_utc_iso_8601()
+    a_value_is_a_number_a_word_or_null()
+    a_snapshot_carries_labels_values_units_and_times()
+    nothing_internal_is_in_a_snapshot()
+    a_history_is_thinned_evenly_keeping_the_last()
+    small_json_answers_are_read()
+    a_directory_publisher_writes_only_where_it_may()
+    feed_star_changes_and_feed_read_looks()
+}

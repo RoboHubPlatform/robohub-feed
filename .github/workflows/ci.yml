@@ -1,0 +1,24 @@
+# CI for this repository: the RoboHub workflow every repository in the
+# ecosystem calls, so the steps are written once (robohub/.github/workflows).
+#
+# Feed builds beside robohub, which carries the shared modules it declares
+# under `deps: robohub:` (ui, i18n, forms, notifications, settings, logging) and
+# the sign-in plugin. Its smoke runs stand-ins for Mesh, an appapi application
+# and the token issuer, so no other application is needed.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: RoboHubPlatform/robohub/.github/workflows/robohub-ci.yml@main
+    secrets: inherit
+    with:
+      siblings: robohub
+      components: rho-auth rho-log rho-sql
+      build: .

@@ -1,0 +1,36 @@
+# Feed's test suites.
+#
+# A suite is declared rather than discovered: the Rho unit tests check the
+# rules (src/feed/domain); the smoke builds Feed and runs it beside stand-ins
+# for Mesh, an appapi application and the keeper's token issuer; the widget
+# test runs widget.js under node with a stand-in DOM.
+
+name: feed
+suites:
+  # Ids, intervals, the file of feeds, the read-only scopes, staleness, UTC
+  # times, values, the snapshot exactly, the privacy check, publisher folders
+  # and grants.
+  # @verifies FEED-0001, FEED-0002, FEED-0003, FEED-0004, FEED-0006, FEED-0007
+  - name: tests/feed_test.rho
+    kind: rho
+    tags: [unit, rho, domain]
+  # The application end to end: a feed made through the forms, its items picked
+  # from what a stand-in Mesh and appapi list, a refresh read with read-only
+  # tokens, the files a directory publisher wrote (every snapshot held against
+  # schemas/feed.v1.json and searched for the stand-ins' ids, addresses and
+  # tokens), a source that stops answering published as stale, a publisher that
+  # fails and recovers, grants and form tokens, and a deleted feed's snapshot
+  # removed.
+  # @verifies FEED-0001, FEED-0002, FEED-0003, FEED-0004, FEED-0006, FEED-0007
+  - name: feed-smoke
+    kind: command
+    tags: [smoke, security]
+    command: [python3, tests/feed_smoke.py]
+  # widget.js under node with a stand-in DOM: the fetch without credentials, the
+  # refresh at the snapshot's interval, number, chart and table, stale marking,
+  # the colour scheme, and nothing stored or loaded besides the snapshot.
+  # @verifies FEED-0005
+  - name: widget
+    kind: command
+    tags: [unit, widget]
+    command: [python3, tests/widget_test.py]

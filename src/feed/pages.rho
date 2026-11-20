@@ -1,0 +1,780 @@
+//
+// @file pages.rho
+// @brief Feed's pages and forms: the list with each feed's status, a feed's settings and items, the preview, publishing now, the publishers.
+//
+// @module feed
+// @project robohub-feed
+// @author Aurel Miron
+// @date 2026-11-20
+//
+// SPDX-License-Identifier: MIT
+//
+
+module feed
+
+// Every page asks feed_may first — `feed:read` to look, `feed:*` to change —
+// and every change is a form posted from these pages with the form token
+// (forms_csrf_ok), answered with a redirect so reloading changes nothing again
+// (FEED-0007). Choosing what goes public is meant to be deliberate: an item's
+// source is picked from what the called applications list, and the preview
+// shows the widget with exactly what would be published.
+
+fn feed_field(body: string, name: string) string {
+    return str_trim(form_field(body, name))
+}
+
+fn feed_back(path: string, kind: string, key: string) Response {
+    return redirect(path + "?" + kind + "=" + key)
+}
+
+// feed_change_ok is whether a POST may change something: a grant to change, and
+// the form token of one of Feed's own pages.
+fn feed_change_refusal(req: Request) string {
+    if !feed_may(req, true) {
+        return "grant"
+    }
+    if !forms_csrf_ok(request_body(req)) {
+        return "csrf"
+    }
+    return ""
+}
+
+fn feed_refused(req: Request, why: string) Response {
+    if str_eq(why, "csrf") {
+        return feed_csrf_refused(req)
+    }
+    return feed_denied(req)
+}
+
+fn feed_checked(on: bool) string {
+    if on {
+        return " checked"
+    }
+    return ""
+}
+
+fn feed_selected(on: bool) string {
+    if on {
+        return " selected"
+    }
+    return ""
+}
+
+/* -------------------------------------------------------------------------- */
+/*  The list                                                                  */
+/* -------------------------------------------------------------------------- */
+
+// feed_list is every feed with its last refresh, last publish and any error.
+// @req FEED-0007
+fn feed_list(req: Request) Response {
+    if !feed_may(req, false) {
+        return feed_denied(req)
+    }
+    let text: string = feed_text()
+    var rows: string = ""
+    var rest: string = fd_feed_ids(text)
+    while rest != "" {
+        let at: i32 = str_index_of(rest, "\n")
+        let id: string = str_slice(rest, 0, u32(at))
+        rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        let feed: string = fd_feed_line(text, id)
+        let state: string = feed_state(id)
+        var on: string = "<span class=\"badge auto\">" + i18n_t(req, "feed.enabled") + "</span>"
+        if !fd_feed_enabled(feed) {
+            on = "<span class=\"badge\">" + i18n_t(req, "feed.disabled") + "</span>"
+        }
+        var problem: string = escape_html(fs_status_error(state))
+        if fs_status_unread(state) > 0 {
+            if problem != "" {
+                problem = problem + "<br>"
+            }
+            problem = problem + escape_html(i18n_t(req, "feed.unread") + " " + int_to_str(fs_status_unread(state)))
+        }
+        rows = rows + "<tr data-feed=\"" + escape_html(id) + "\"><td><a href=\"/feeds/" + escape_html(id) + "\">" +
+            escape_html(fd_feed_title(feed)) + "</a><div class=\"d\"><code>" + escape_html(id) + "</code></div></td>" +
+            "<td class=\"num\">" + int_to_str(fd_line_count(fd_items(text, id))) + "</td>" +
+            "<td class=\"num\">" + int_to_str(fd_feed_interval(feed)) + " s</td><td>" + on + "</td>" +
+            "<td>" + escape_html(feed_when(req, fs_status_refreshed(state))) + "</td>" +
+            "<td>" + escape_html(feed_when(req, fs_status_published(state))) + "</td>" +
+            "<td class=\"err\">" + problem + "</td></tr>"
+    }
+    var table: string = "<p class=\"rh-empty\">" + i18n_t(req, "feed.none") + "</p>"
+    if rows != "" {
+        table = "<table class=\"feeds\"><thead><tr><th>" + i18n_t(req, "feed.title") + "</th><th>" +
+            i18n_t(req, "feed.items") + "</th><th>" + i18n_t(req, "feed.interval") + "</th><th>" +
+            i18n_t(req, "feed.state") + "</th><th>" + i18n_t(req, "feed.last_refresh") + "</th><th>" +
+            i18n_t(req, "feed.last_publish") + "</th><th>" + i18n_t(req, "feed.error") + "</th></tr></thead><tbody>" +
+            rows + "</tbody></table>"
+    }
+    var add: string = ""
+    if feed_may(req, true) {
+        add = "<a class=\"rh-new\" href=\"/feeds/new\">" + i18n_t(req, "feed.new") + "</a>"
+    }
+    return feed_page(req, status_ok(), i18n_t(req, "nav.feeds"),
+        "<div class=\"ph\"><h1>" + i18n_t(req, "nav.feeds") + "</h1><p>" + i18n_t(req, "feed.lede") + "</p></div>" +
+        "<section class=\"rh-card wide\">" + add + table + "</section>")
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Making a feed                                                             */
+/* -------------------------------------------------------------------------- */
+
+// feed_publisher_choices are a checkbox per publisher, ticked when the list
+// names it.
+fn feed_publisher_choices(req: Request, text: string, chosen: string) string {
+    var out: string = ""
+    var rest: string = fd_publisher_lines(text)
+    while rest != "" {
+        let at: i32 = str_index_of(rest, "\n")
+        let line: string = str_slice(rest, 0, u32(at))
+        rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        let name: string = fd_publisher_name(line)
+        out = out + "<label class=\"check\"><input type=\"checkbox\" name=\"pub_" + escape_html(name) + "\" value=\"1\"" +
+            feed_checked(fd_list_has(chosen, name)) + "> " + escape_html(name) + " <small>(" +
+            escape_html(fd_publisher_kind(line)) + " · " + escape_html(fd_publisher_target(line)) + ")</small></label>"
+    }
+    return out
+}
+
+// feed_publishers_posted are the publishers a form ticked, comma separated.
+fn feed_publishers_posted(text: string, body: string) string {
+    var out: string = ""
+    var rest: string = fd_publisher_lines(text)
+    while rest != "" {
+        let at: i32 = str_index_of(rest, "\n")
+        let line: string = str_slice(rest, 0, u32(at))
+        rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        let name: string = fd_publisher_name(line)
+        if str_eq(form_field(body, "pub_" + name), "1") {
+            if out != "" {
+                out = out + ","
+            }
+            out = out + name
+        }
+    }
+    return out
+}
+
+fn feed_settings_form(req: Request, action: string, title: string, interval: u32, enabled: bool,
+    publishers: string, text: string, button: string) string {
+    return "<form method=\"post\" action=\"" + action + "\" class=\"app-form grid-form\">" + forms_csrf_field() +
+        "<label>" + i18n_t(req, "feed.title") + "<input name=\"title\" required maxlength=\"120\" value=\"" +
+        escape_html(title) + "\"></label>" +
+        "<label>" + i18n_t(req, "feed.interval_s") + "<input name=\"interval\" type=\"number\" min=\"30\" max=\"86400\" value=\"" +
+        int_to_str(interval) + "\"></label>" +
+        "<label class=\"check\"><input type=\"checkbox\" name=\"enabled\" value=\"1\"" + feed_checked(enabled) + "> " +
+        i18n_t(req, "feed.enabled") + "</label>" +
+        "<fieldset class=\"pubs\"><legend>" + i18n_t(req, "feed.publishers") + "</legend>" +
+        feed_publisher_choices(req, text, publishers) + "</fieldset>" +
+        "<div class=\"app-actions\"><button type=\"submit\">" + escape_html(button) + "</button></div></form>"
+}
+
+// @req FEED-0007
+fn feed_new_page(req: Request) Response {
+    if !feed_may(req, true) {
+        return feed_denied(req)
+    }
+    let text: string = feed_text()
+    return feed_page(req, status_ok(), i18n_t(req, "feed.new"),
+        "<div class=\"ph\"><h1>" + i18n_t(req, "feed.new") + "</h1><p>" + i18n_t(req, "feed.new_lede") + "</p></div>" +
+        "<section class=\"rh-card wide\">" +
+        feed_settings_form(req, "/feeds", "", 60, true, "local", text, i18n_t(req, "feed.create")) + "</section>")
+}
+
+// feed_create makes a feed with an id of its own (FEED-0001) and no items yet.
+// @req FEED-0001, FEED-0007
+fn feed_create(req: Request) Response {
+    let refused: string = feed_change_refusal(req)
+    if refused != "" {
+        return feed_refused(req, refused)
+    }
+    let body: string = request_body(req)
+    rho_lock("feed-file")
+    let text: string = feed_text()
+    let title: string = feed_field(body, "title")
+    let interval: string = feed_field(body, "interval")
+    let publishers: string = feed_publishers_posted(text, body)
+    let wrong: string = fd_validate_feed(title, interval, publishers, text)
+    if wrong != "" {
+        rho_unlock("feed-file")
+        return feed_back("/feeds/new", "error", wrong)
+    }
+    if fd_line_count(fd_feed_ids(text)) >= FD_FEEDS_MAX {
+        rho_unlock("feed-file")
+        return feed_back("/feeds/new", "error", "feed.error.too_many")
+    }
+    let id: string = feed_new_id()
+    if id == "" || fd_feed_line(text, id) != "" {
+        rho_unlock("feed-file")
+        return feed_back("/feeds/new", "error", "feed.error.id")
+    }
+    let line: string = fd_feed_make(id, title, int_from_str(interval), str_eq(form_field(body, "enabled"), "1"), publishers)
+    let saved: bool = feed_save(fd_replace_feed(text, id, line, ""))
+    rho_unlock("feed-file")
+    if !saved {
+        return feed_back("/feeds/new", "error", "feed.error.save")
+    }
+    info("feed", "feed " + id + " created")
+    return feed_back("/feeds/" + id, "done", "feed.created")
+}
+
+/* -------------------------------------------------------------------------- */
+/*  A feed                                                                    */
+/* -------------------------------------------------------------------------- */
+
+// feed_source_text is an item's source as the feed's own pages show it. It
+// names internals, which is why it is shown here and never published.
+fn feed_source_text(item: string) string {
+    let app: string = fd_item_app(item)
+    if str_eq(app, "mesh") {
+        return "Mesh · " + fd_item_ref(item) + " · " + fd_item_sub(item)
+    }
+    return feed_app_title(app) + " · " + fd_item_ref(item)
+}
+
+fn feed_decimals_select(req: Request, current: string) string {
+    var out: string = "<select name=\"decimals\"><option value=\"\"" + feed_selected(current == "") + ">" +
+        i18n_t(req, "item.decimals_as_read") + "</option>"
+    var d: u32 = 0
+    while d <= 3 {
+        let v: string = int_to_str(d)
+        out = out + "<option value=\"" + v + "\"" + feed_selected(str_eq(current, v)) + ">" + v + "</option>"
+        d = d + 1
+    }
+    return out + "</select>"
+}
+
+fn feed_history_select(req: Request, current: string) string {
+    return "<select name=\"history\">" +
+        "<option value=\"none\"" + feed_selected(current == "" || str_eq(current, "none")) + ">" + i18n_t(req, "item.history_none") + "</option>" +
+        "<option value=\"1h\"" + feed_selected(str_eq(current, "1h")) + ">" + i18n_t(req, "item.history_1h") + "</option>" +
+        "<option value=\"24h\"" + feed_selected(str_eq(current, "24h")) + ">" + i18n_t(req, "item.history_24h") + "</option></select>"
+}
+
+// feed_picker is the source picker: what the called applications list, with
+// the unit each reading has, and a note for one that did not answer.
+// @req FEED-0007
+fn feed_picker(req: Request) string {
+    var options: string = ""
+    var silent: string = ""
+    var rest: string = feed_source_options()
+    while rest != "" {
+        let at: i32 = str_index_of(rest, "\n")
+        let line: string = str_slice(rest, 0, u32(at))
+        rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        if str_starts_with(line, "!") {
+            if silent != "" {
+                silent = silent + ", "
+            }
+            silent = silent + feed_app_title(str_slice(line, 1, strlen(line) - 1))
+            continue
+        }
+        options = options + "<option value=\"" + escape_html(str_field(line, "\t", 0)) + "\" data-unit=\"" +
+            escape_html(str_field(line, "\t", 2)) + "\">" + escape_html(str_field(line, "\t", 1)) + "</option>"
+    }
+    var note: string = ""
+    if silent != "" {
+        note = "<p class=\"hint\">" + escape_html(i18n_t(req, "item.silent") + " " + silent) + "</p>"
+    }
+    if options == "" {
+        return note + "<p class=\"hint\">" + i18n_t(req, "item.no_sources") + "</p>"
+    }
+    return "<label>" + i18n_t(req, "item.source") + "<select name=\"source\" id=\"source\" required><option value=\"\">" +
+        i18n_t(req, "item.choose") + "</option>" + options + "</select></label>" + note
+}
+
+fn feed_items_table(req: Request, id: string, items: string, write: bool) string {
+    if items == "" {
+        return "<p class=\"rh-empty\">" + i18n_t(req, "item.none") + "</p>"
+    }
+    var rows: string = ""
+    var position: u32 = 1
+    let n: u32 = fd_line_count(items)
+    while position <= n {
+        let item: string = fd_item_at(items, position)
+        let base: string = "/feeds/" + id + "/items/" + int_to_str(position)
+        var edit: string = escape_html(fd_item_label(item))
+        var unit: string = escape_html(fd_item_unit(item))
+        var decimals: string = escape_html(fd_item_decimals(item))
+        var history: string = escape_html(fd_item_history(item))
+        var actions: string = ""
+        if write {
+            let form: string = "item-" + int_to_str(position)
+            edit = "<input form=\"" + form + "\" name=\"label\" maxlength=\"80\" value=\"" + escape_html(fd_item_label(item)) + "\">"
+            unit = "<input form=\"" + form + "\" name=\"unit\" maxlength=\"16\" size=\"5\" value=\"" + escape_html(fd_item_unit(item)) + "\">"
+            decimals = str_replace(feed_decimals_select(req, fd_item_decimals(item)), "<select ", "<select form=\"" + form + "\" ")
+            history = str_replace(feed_history_select(req, fd_item_history(item)), "<select ", "<select form=\"" + form + "\" ")
+            actions = "<form id=\"" + form + "\" method=\"post\" action=\"" + base + "\" class=\"inline\">" + forms_csrf_field() +
+                "<button type=\"submit\" class=\"quiet\">" + i18n_t(req, "item.save") + "</button></form> " +
+                "<form method=\"post\" action=\"" + base + "/delete\" class=\"inline\">" + forms_csrf_field() +
+                "<button type=\"submit\" class=\"quiet danger\">" + i18n_t(req, "item.remove") + "</button></form>"
+        }
+        rows = rows + "<tr><td><code>" + fs_key(position) + "</code></td><td>" + edit + "</td><td class=\"d\">" +
+            escape_html(feed_source_text(item)) + "</td><td>" + unit + "</td><td>" + decimals + "</td><td>" + history +
+            "</td><td>" + actions + "</td></tr>"
+        position = position + 1
+    }
+    return "<table class=\"items\"><thead><tr><th>" + i18n_t(req, "item.key") + "</th><th>" + i18n_t(req, "item.label") +
+        "</th><th>" + i18n_t(req, "item.source") + "</th><th>" + i18n_t(req, "item.unit") + "</th><th>" +
+        i18n_t(req, "item.decimals") + "</th><th>" + i18n_t(req, "item.history") + "</th><th></th></tr></thead><tbody>" +
+        rows + "</tbody></table><p class=\"hint\">" + i18n_t(req, "item.keys_hint") + "</p>"
+}
+
+// The script that fills an empty unit from the source chosen on the picker.
+const FEED_PICKER_SCRIPT: string = "<script>(function(){var s=document.getElementById('source');if(!s)return;s.addEventListener('change',function(){var o=s.options[s.selectedIndex];var u=document.getElementById('unit');if(o&&u&&!u.value){u.value=o.getAttribute('data-unit')||'';}});})();</script>"
+
+// feed_edit_page is one feed: its status, its settings, its items, adding an
+// item from the picker, and publishing, previewing and deleting it.
+// @req FEED-0007
+fn feed_edit_page(req: Request) Response {
+    if !feed_may(req, false) {
+        return feed_denied(req)
+    }
+    let id: string = param(req, "id")
+    let text: string = feed_text()
+    let feed: string = fd_feed_line(text, id)
+    if !fd_id_ok(id) || feed == "" {
+        return feed_page(req, status_not_found(), i18n_t(req, "feed.missing"),
+            "<section class=\"rh-card wide\"><h1>" + i18n_t(req, "feed.missing") + "</h1><p><a href=\"/\">" +
+            i18n_t(req, "access.back") + "</a></p></section>")
+    }
+    let write: bool = feed_may(req, true)
+    let state: string = feed_state(id)
+    let items: string = fd_items(text, id)
+    let base: string = "/feeds/" + id
+    var status: string = "<dl class=\"status\"><dt>" + i18n_t(req, "feed.last_refresh") + "</dt><dd>" +
+        escape_html(feed_when(req, fs_status_refreshed(state))) + "</dd><dt>" + i18n_t(req, "feed.last_publish") +
+        "</dt><dd>" + escape_html(feed_when(req, fs_status_published(state))) + "</dd><dt>" + i18n_t(req, "feed.error") +
+        "</dt><dd class=\"err\">" + escape_html(fs_status_error(state)) + "</dd><dt>" + i18n_t(req, "feed.unread") +
+        "</dt><dd>" + int_to_str(fs_status_unread(state)) + "</dd><dt>" + i18n_t(req, "feed.address") + "</dt><dd><code>feeds/" +
+        escape_html(id) + ".json</code></dd></dl>"
+    var actions: string = "<a class=\"rh-new\" href=\"" + base + "/preview\">" + i18n_t(req, "feed.preview") + "</a>"
+    var settings: string = ""
+    var add: string = ""
+    if write {
+        actions = actions + " <form method=\"post\" action=\"" + base + "/publish\" class=\"inline\">" + forms_csrf_field() +
+            "<button type=\"submit\">" + i18n_t(req, "feed.publish_now") + "</button></form>" +
+            " <form method=\"post\" action=\"" + base + "/delete\" class=\"inline\" onsubmit=\"return confirm(" +
+            escape_html(json_string(i18n_t(req, "feed.delete_confirm"))) + ")\">" + forms_csrf_field() +
+            "<button type=\"submit\" class=\"danger\">" + i18n_t(req, "feed.delete") + "</button></form>"
+        settings = "<section class=\"rh-card wide\"><h2>" + i18n_t(req, "feed.settings") + "</h2>" +
+            feed_settings_form(req, base, fd_feed_title(feed), fd_feed_interval(feed), fd_feed_enabled(feed),
+                fd_feed_publishers(feed), text, i18n_t(req, "feed.save")) + "</section>"
+        add = "<section class=\"rh-card wide\"><h2>" + i18n_t(req, "item.add") + "</h2><p class=\"hint\">" +
+            i18n_t(req, "item.add_hint") + "</p><form method=\"post\" action=\"" + base + "/items\" class=\"app-form grid-form\">" +
+            forms_csrf_field() + feed_picker(req) +
+            "<label>" + i18n_t(req, "item.label") + "<input name=\"label\" required maxlength=\"80\"></label>" +
+            "<label>" + i18n_t(req, "item.unit") + "<input name=\"unit\" id=\"unit\" maxlength=\"16\"></label>" +
+            "<label>" + i18n_t(req, "item.decimals") + feed_decimals_select(req, "") + "</label>" +
+            "<label>" + i18n_t(req, "item.history") + feed_history_select(req, "none") + "</label>" +
+            "<div class=\"app-actions\"><button type=\"submit\">" + i18n_t(req, "item.add_button") + "</button></div></form>" +
+            FEED_PICKER_SCRIPT + "</section>"
+    }
+    return feed_page(req, status_ok(), fd_feed_title(feed),
+        "<div class=\"ph\"><h1>" + escape_html(fd_feed_title(feed)) + "</h1><p>" + i18n_t(req, "feed.edit_lede") + "</p></div>" +
+        "<section class=\"rh-card wide\"><div class=\"feed-actions\">" + actions + "</div>" + status + "</section>" +
+        "<section class=\"rh-card wide\"><h2>" + i18n_t(req, "feed.items") + "</h2>" + feed_items_table(req, id, items, write) +
+        "</section>" + add + settings)
+}
+
+// feed_save_settings changes a feed's title, interval, whether it is enabled
+// and its publishers; a publisher taken off it has the feed's snapshot taken
+// back.
+// @req FEED-0001, FEED-0006, FEED-0007
+fn feed_save_settings(req: Request) Response {
+    let refused: string = feed_change_refusal(req)
+    if refused != "" {
+        return feed_refused(req, refused)
+    }
+    let id: string = param(req, "id")
+    let body: string = request_body(req)
+    rho_lock("feed-file")
+    let text: string = feed_text()
+    let feed: string = fd_feed_line(text, id)
+    if !fd_id_ok(id) || feed == "" {
+        rho_unlock("feed-file")
+        return feed_back("/", "error", "feed.missing")
+    }
+    let title: string = feed_field(body, "title")
+    let interval: string = feed_field(body, "interval")
+    let publishers: string = feed_publishers_posted(text, body)
+    let wrong: string = fd_validate_feed(title, interval, publishers, text)
+    if wrong != "" {
+        rho_unlock("feed-file")
+        return feed_back("/feeds/" + id, "error", wrong)
+    }
+    let line: string = fd_feed_make(id, title, int_from_str(interval), str_eq(form_field(body, "enabled"), "1"), publishers)
+    let saved: bool = feed_save(fd_replace_feed(text, id, line, fd_items(text, id)))
+    // The publishers the feed no longer names give its snapshot back.
+    var dropped: string = ""
+    let before: string = fd_feed_publishers(feed)
+    var i: u32 = 0
+    while i <= fd_comma_count(before) {
+        let name: string = str_trim(str_field(before, ",", i))
+        i = i + 1
+        if name != "" && !fd_list_has(publishers, name) {
+            dropped = dropped + name + ","
+        }
+    }
+    if saved && dropped != "" {
+        feed_unpublish(text, id, dropped)
+    }
+    rho_unlock("feed-file")
+    if !saved {
+        return feed_back("/feeds/" + id, "error", "feed.error.save")
+    }
+    return feed_back("/feeds/" + id, "done", "feed.saved")
+}
+
+// feed_item_add adds an item whose source was picked from what a called
+// application lists (FEED-0001, FEED-0007).
+// @req FEED-0001, FEED-0007
+fn feed_item_add(req: Request) Response {
+    let refused: string = feed_change_refusal(req)
+    if refused != "" {
+        return feed_refused(req, refused)
+    }
+    let id: string = param(req, "id")
+    let body: string = request_body(req)
+    let source: string = feed_field(body, "source")
+    let app: string = fd_field(source, 0)
+    let ref: string = fd_field(source, 1)
+    let sub: string = fd_field(source, 2)
+    let label: string = feed_field(body, "label")
+    let unit: string = feed_field(body, "unit")
+    let decimals: string = feed_field(body, "decimals")
+    var history: string = feed_field(body, "history")
+    if history == "" {
+        history = "none"
+    }
+    let wrong: string = fd_validate_item(label, app, ref, sub, unit, decimals, history, feed_calls())
+    if wrong != "" {
+        return feed_back("/feeds/" + id, "error", wrong)
+    }
+    rho_lock("feed-file")
+    let text: string = feed_text()
+    let feed: string = fd_feed_line(text, id)
+    if !fd_id_ok(id) || feed == "" {
+        rho_unlock("feed-file")
+        return feed_back("/", "error", "feed.missing")
+    }
+    let items: string = fd_items(text, id)
+    if fd_line_count(items) >= FD_ITEMS_MAX {
+        rho_unlock("feed-file")
+        return feed_back("/feeds/" + id, "error", "item.error.too_many")
+    }
+    let line: string = fd_item_make(id, label, app, ref, sub, unit, decimals, history)
+    let saved: bool = feed_save(fd_replace_feed(text, id, feed, items + line + "\n"))
+    rho_unlock("feed-file")
+    if !saved {
+        return feed_back("/feeds/" + id, "error", "feed.error.save")
+    }
+    return feed_back("/feeds/" + id, "done", "item.added")
+}
+
+// feed_item_save changes an item's label, unit, decimals and history; its
+// source stays what was picked.
+// @req FEED-0001, FEED-0007
+fn feed_item_save(req: Request) Response {
+    let refused: string = feed_change_refusal(req)
+    if refused != "" {
+        return feed_refused(req, refused)
+    }
+    let id: string = param(req, "id")
+    let position: u32 = int_from_str(param(req, "n"))
+    let body: string = request_body(req)
+    rho_lock("feed-file")
+    let text: string = feed_text()
+    let feed: string = fd_feed_line(text, id)
+    let items: string = fd_items(text, id)
+    let item: string = fd_item_at(items, position)
+    if !fd_id_ok(id) || feed == "" || item == "" {
+        rho_unlock("feed-file")
+        return feed_back("/feeds/" + id, "error", "item.missing")
+    }
+    let label: string = feed_field(body, "label")
+    let unit: string = feed_field(body, "unit")
+    let decimals: string = feed_field(body, "decimals")
+    var history: string = feed_field(body, "history")
+    if history == "" {
+        history = "none"
+    }
+    let wrong: string = fd_validate_item(label, fd_item_app(item), fd_item_ref(item), fd_item_sub(item), unit,
+        decimals, history, feed_calls())
+    if wrong != "" {
+        rho_unlock("feed-file")
+        return feed_back("/feeds/" + id, "error", wrong)
+    }
+    let line: string = fd_item_make(id, label, fd_item_app(item), fd_item_ref(item), fd_item_sub(item), unit, decimals, history)
+    let saved: bool = feed_save(fd_replace_feed(text, id, feed, fd_items_with(items, position, line)))
+    rho_unlock("feed-file")
+    if !saved {
+        return feed_back("/feeds/" + id, "error", "feed.error.save")
+    }
+    return feed_back("/feeds/" + id, "done", "item.saved")
+}
+
+// @req FEED-0007
+fn feed_item_remove(req: Request) Response {
+    let refused: string = feed_change_refusal(req)
+    if refused != "" {
+        return feed_refused(req, refused)
+    }
+    let id: string = param(req, "id")
+    let position: u32 = int_from_str(param(req, "n"))
+    rho_lock("feed-file")
+    let text: string = feed_text()
+    let feed: string = fd_feed_line(text, id)
+    let items: string = fd_items(text, id)
+    if !fd_id_ok(id) || feed == "" || fd_item_at(items, position) == "" {
+        rho_unlock("feed-file")
+        return feed_back("/feeds/" + id, "error", "item.missing")
+    }
+    let saved: bool = feed_save(fd_replace_feed(text, id, feed, fd_items_without(items, position)))
+    rho_unlock("feed-file")
+    if !saved {
+        return feed_back("/feeds/" + id, "error", "feed.error.save")
+    }
+    return feed_back("/feeds/" + id, "done", "item.removed")
+}
+
+// feed_publish_now refreshes and publishes a feed at once, rather than at its
+// next interval (FEED-0007). A disabled feed is not published.
+// @req FEED-0007
+fn feed_publish_now(req: Request) Response {
+    let refused: string = feed_change_refusal(req)
+    if refused != "" {
+        return feed_refused(req, refused)
+    }
+    let id: string = param(req, "id")
+    let result: string = feed_refresh(id, false)
+    if str_eq(result, "missing") {
+        return feed_back("/", "error", "feed.missing")
+    }
+    if str_eq(result, "disabled") {
+        return feed_back("/feeds/" + id, "error", "feed.error.disabled")
+    }
+    if result != "" {
+        return feed_back("/feeds/" + id, "error", "feed.error.publish")
+    }
+    return feed_back("/feeds/" + id, "done", "feed.published")
+}
+
+// feed_delete deletes a feed: its snapshot is taken back from its directory
+// publishers first, then the feed, its items and its state go (FEED-0007).
+// @req FEED-0007
+fn feed_delete(req: Request) Response {
+    let refused: string = feed_change_refusal(req)
+    if refused != "" {
+        return feed_refused(req, refused)
+    }
+    let id: string = param(req, "id")
+    // No refresh may publish the feed again while it goes.
+    rho_lock("feed-refresh")
+    rho_lock("feed-file")
+    let text: string = feed_text()
+    let feed: string = fd_feed_line(text, id)
+    if !fd_id_ok(id) || feed == "" {
+        rho_unlock("feed-file")
+        rho_unlock("feed-refresh")
+        return feed_back("/", "error", "feed.missing")
+    }
+    feed_unpublish(text, id, fd_feed_publishers(feed))
+    let saved: bool = feed_save(fd_replace_feed(text, id, "", ""))
+    if saved {
+        feed_state_remove(id)
+    }
+    rho_unlock("feed-file")
+    rho_unlock("feed-refresh")
+    if !saved {
+        return feed_back("/feeds/" + id, "error", "feed.error.save")
+    }
+    info("feed", "feed " + id + " deleted")
+    return feed_back("/", "done", "feed.deleted")
+}
+
+/* -------------------------------------------------------------------------- */
+/*  The preview                                                               */
+/* -------------------------------------------------------------------------- */
+
+// feed_preview shows the feed's widget drawing the snapshot that would be
+// published now, from the last readings, before anything goes out (FEED-0007).
+// The snapshot is given to the widget inline, as a data: address, so the
+// preview needs no route outside the sign-in.
+// @req FEED-0007
+fn feed_preview(req: Request) Response {
+    if !feed_may(req, false) {
+        return feed_denied(req)
+    }
+    let id: string = param(req, "id")
+    let text: string = feed_text()
+    let feed: string = fd_feed_line(text, id)
+    if !fd_id_ok(id) || feed == "" {
+        return feed_back("/", "error", "feed.missing")
+    }
+    let items: string = fd_items(text, id)
+    let snapshot: string = fs_snapshot(feed, items, feed_state(id), rho_now_s())
+    let src: string = escape_html("data:application/json," + str_url_encode(snapshot))
+    var singles: string = ""
+    var position: u32 = 1
+    let n: u32 = fd_line_count(items)
+    while position <= n {
+        let item: string = fd_item_at(items, position)
+        var kind: string = "number"
+        if fd_history_seconds(fd_item_history(item)) > 0 {
+            kind = "chart"
+        }
+        singles = singles + "<div class=\"preview-one\"><robohub-widget src=\"" + src + "\" item=\"" + fs_key(position) +
+            "\" kind=\"" + kind + "\"></robohub-widget><code>item=\"" + fs_key(position) + "\" kind=\"" + kind + "\"</code></div>"
+        position = position + 1
+    }
+    let embed: string = "<script src=\"https://example.org/robohub/widget.js\" defer></script>\n" +
+        "<robohub-widget src=\"https://example.org/robohub/feeds/" + id + ".json\" kind=\"table\"></robohub-widget>"
+    return feed_page(req, status_ok(), i18n_t(req, "feed.preview"),
+        "<div class=\"ph\"><h1>" + i18n_t(req, "feed.preview") + " — " + escape_html(fd_feed_title(feed)) + "</h1><p>" +
+        i18n_t(req, "preview.lede") + "</p></div>" +
+        "<section class=\"rh-card wide\"><h2>" + i18n_t(req, "preview.table") + "</h2><robohub-widget src=\"" + src +
+        "\" kind=\"table\"></robohub-widget></section>" +
+        "<section class=\"rh-card wide\"><h2>" + i18n_t(req, "preview.items") + "</h2><div class=\"preview-grid\">" + singles +
+        "</div></section>" +
+        "<section class=\"rh-card wide\"><h2>" + i18n_t(req, "preview.embed") + "</h2><p class=\"hint\">" +
+        i18n_t(req, "preview.embed_hint") + "</p><pre class=\"embed\">" + escape_html(embed) + "</pre>" +
+        "<details><summary>" + i18n_t(req, "preview.json") + "</summary><pre class=\"embed\">" + escape_html(snapshot) +
+        "</pre></details><p><a href=\"/feeds/" + id + "\">" + i18n_t(req, "access.back") + "</a></p></section>" +
+        "<script src=\"/widget.js\" defer></script>")
+}
+
+// feed_widget serves widget.js to the preview: the same file the publishers
+// write.
+// @req FEED-0005
+fn feed_widget(req: Request) Response {
+    return Response{ 200, rho_asset("feed", "static/widget.js"), "text/javascript; charset=utf-8", "Cache-Control: no-cache" }
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Publishers                                                                */
+/* -------------------------------------------------------------------------- */
+
+// publishers_page lists the publishers and the feeds that name each, and adds
+// or changes one. Only `directory` exists; the kinds robohub ADR-0019 names for
+// later are shown, and refused (FEED-0006).
+// @req FEED-0006, FEED-0007
+fn publishers_page(req: Request) Response {
+    if !feed_may(req, false) {
+        return feed_denied(req)
+    }
+    let write: bool = feed_may(req, true)
+    let text: string = feed_text()
+    var rows: string = ""
+    var rest: string = fd_publisher_lines(text)
+    while rest != "" {
+        let at: i32 = str_index_of(rest, "\n")
+        let line: string = str_slice(rest, 0, u32(at))
+        rest = str_slice(rest, u32(at) + 1, strlen(rest) - u32(at) - 1)
+        let name: string = fd_publisher_name(line)
+        let using: u32 = fd_line_count(fd_feeds_using(text, name))
+        var remove: string = ""
+        if write && using == 0 {
+            remove = "<form method=\"post\" action=\"/publishers/" + escape_html(name) + "/delete\" class=\"inline\">" +
+                forms_csrf_field() + "<button type=\"submit\" class=\"quiet danger\">" + i18n_t(req, "publisher.remove") +
+                "</button></form>"
+        }
+        rows = rows + "<tr><td>" + escape_html(name) + "</td><td>" + escape_html(fd_publisher_kind(line)) + "</td><td><code>" +
+            escape_html(fd_publisher_target(line)) + "</code></td><td class=\"num\">" + int_to_str(using) + "</td><td>" +
+            remove + "</td></tr>"
+    }
+    var form: string = ""
+    if write {
+        form = "<section class=\"rh-card wide\"><h2>" + i18n_t(req, "publisher.add") + "</h2><p class=\"hint\">" +
+            i18n_t(req, "publisher.add_hint") + "</p><form method=\"post\" action=\"/publishers\" class=\"app-form grid-form\">" +
+            forms_csrf_field() +
+            "<label>" + i18n_t(req, "publisher.name") + "<input name=\"name\" required maxlength=\"32\" pattern=\"[a-z][a-z0-9-]*\"></label>" +
+            "<label>" + i18n_t(req, "publisher.kind") + "<select name=\"kind\"><option value=\"directory\">directory</option>" +
+            "<option value=\"git\" disabled>git — " + i18n_t(req, "publisher.later") + "</option>" +
+            "<option value=\"ssh\" disabled>ssh — " + i18n_t(req, "publisher.later") + "</option>" +
+            "<option value=\"s3\" disabled>s3 — " + i18n_t(req, "publisher.later") + "</option></select></label>" +
+            "<label>" + i18n_t(req, "publisher.folder") + "<input name=\"target\" required maxlength=\"512\" placeholder=\"/srv/www/robohub\"></label>" +
+            "<div class=\"app-actions\"><button type=\"submit\">" + i18n_t(req, "publisher.save") + "</button></div></form></section>"
+    }
+    return feed_page(req, status_ok(), i18n_t(req, "nav.publishers"),
+        "<div class=\"ph\"><h1>" + i18n_t(req, "nav.publishers") + "</h1><p>" + i18n_t(req, "publisher.lede") + "</p></div>" +
+        "<section class=\"rh-card wide\"><table><thead><tr><th>" + i18n_t(req, "publisher.name") + "</th><th>" +
+        i18n_t(req, "publisher.kind") + "</th><th>" + i18n_t(req, "publisher.folder") + "</th><th>" +
+        i18n_t(req, "publisher.feeds") + "</th><th></th></tr></thead><tbody>" + rows + "</tbody></table></section>" + form)
+}
+
+// publisher_save adds a publisher, or changes the one of that name. A kind that
+// does not exist yet is refused (FEED-0006), and so is a folder the rules do
+// not allow.
+// @req FEED-0006, FEED-0007
+fn publisher_save(req: Request) Response {
+    let refused: string = feed_change_refusal(req)
+    if refused != "" {
+        return feed_refused(req, refused)
+    }
+    let body: string = request_body(req)
+    let name: string = feed_field(body, "name")
+    let kind: string = feed_field(body, "kind")
+    let target: string = fp_trim_slash(feed_field(body, "target"))
+    if !fd_name_ok(name) {
+        return feed_back("/publishers", "error", "publisher.error.name")
+    }
+    if fp_kind_planned(kind) {
+        return feed_back("/publishers", "error", "publisher.error.later")
+    }
+    if !fp_kind_exists(kind) {
+        return feed_back("/publishers", "error", "publisher.error.kind")
+    }
+    if !fp_dir_ok(target, feed_home(), feed_dir()) {
+        return feed_back("/publishers", "error", "publisher.error.folder")
+    }
+    rho_lock("feed-file")
+    let saved: bool = feed_save(fd_replace_publisher(feed_text(), name, fd_publisher_make(name, kind, target)))
+    rho_unlock("feed-file")
+    if !saved {
+        return feed_back("/publishers", "error", "feed.error.save")
+    }
+    return feed_back("/publishers", "done", "publisher.saved")
+}
+
+// publisher_delete removes a publisher no feed names.
+// @req FEED-0007
+fn publisher_delete(req: Request) Response {
+    let refused: string = feed_change_refusal(req)
+    if refused != "" {
+        return feed_refused(req, refused)
+    }
+    let name: string = param(req, "name")
+    rho_lock("feed-file")
+    let text: string = feed_text()
+    if fd_publisher_line(text, name) == "" {
+        rho_unlock("feed-file")
+        return feed_back("/publishers", "error", "publisher.missing")
+    }
+    if fd_feeds_using(text, name) != "" {
+        rho_unlock("feed-file")
+        return feed_back("/publishers", "error", "publisher.error.in_use")
+    }
+    let saved: bool = feed_save(fd_replace_publisher(text, name, ""))
+    rho_unlock("feed-file")
+    if !saved {
+        return feed_back("/publishers", "error", "feed.error.save")
+    }
+    return feed_back("/publishers", "done", "publisher.removed")
+}
+
+/* -------------------------------------------------------------------------- */
+/*  The guide                                                                 */
+/* -------------------------------------------------------------------------- */
+
+fn feed_docs(req: Request) Response {
+    if !feed_may(req, false) {
+        return feed_denied(req)
+    }
+    var content: string = rho_asset("feed", "docs/doc/index.md")
+    if content == "" {
+        content = "No documentation found."
+    }
+    return feed_page(req, status_ok(), i18n_t(req, "nav.docs"), "<div class=\"ph\"><h1>" + i18n_t(req, "nav.docs") +
+        "</h1></div><section class=\"rh-card wide\"><pre class=\"docs\">" + escape_html(content) + "</pre></section>")
+}

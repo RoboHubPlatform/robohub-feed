@@ -1,0 +1,3 @@
+-- Feed keeps no tables of its own: its feeds are a text file in the
+-- application's workspace (docs/architecture/adr/0001). The tables here are the
+-- shared modules' (the notifications a page shows), generated in by rho-sql 0.2.
