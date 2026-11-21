@@ -66,6 +66,10 @@ class HTMLElement {
   attachShadow(options) { this.shadowRoot = { innerHTML: "", mode: options.mode }; return this.shadowRoot; }
 }
 global.HTMLElement = HTMLElement;
+// Constructed stylesheets, as a browser has them: the widget adopts one rather
+// than drawing a <style> element a page's style-src would block (FEED-0005).
+class CSSStyleSheet { replaceSync(text) { this.text = text; } }
+global.CSSStyleSheet = CSSStyleSheet;
 
 const fetches = [];
 let answer = null;
@@ -115,7 +119,8 @@ const snapshot = {
   check(!/<tr class="stale"><td>Air/.test(t), "a current one is not");
   check(!t.includes("<img") && t.includes("&lt;img src=x"), "a label is escaped, never markup");
   check(timers.length === 1 && timers[0].ms === 45000, "the next fetch is set for the snapshot's refresh (45 s)");
-  check(t.includes("prefers-color-scheme:dark") && t.includes("--rw-bg") && t.includes("var(--rw-fg)"),
+  const style = t + ((table.shadowRoot.adoptedStyleSheets || []).map((sheet) => sheet.text).join(""));
+  check(style.includes("prefers-color-scheme:dark") && style.includes("--rw-bg") && style.includes("var(--rw-fg)"),
         "the style follows the page's scheme through custom properties");
 
   const number = make({ src: "s.json", item: "i2", kind: "number" });
@@ -146,6 +151,9 @@ const snapshot = {
   await settle();
   check(wrong.shadowRoot.innerHTML.includes("unavailable"), "a document that is not a feed snapshot is not drawn");
   check(wrong.shadowRoot.mode === "open", "the widget draws in its own shadow root");
+  const sheets = wrong.shadowRoot.adoptedStyleSheets || [];
+  check(sheets.length === 1 && (sheets[0].text || "").length > 0 && !table.shadowRoot.innerHTML.includes("<style"),
+        "it is styled by an adopted stylesheet, with no <style> element a page's style-src would block");
 
   check(fetches.every((f) => f.options && f.options.credentials === "omit"), "every fetch omits credentials");
   check(touched.length === 0, "nothing stored, no cookie, nothing else loaded (" + touched.join(",") + ")");

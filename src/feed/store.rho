@@ -16,6 +16,8 @@ module feed
 // gives it, readable by its owner only):
 //
 //   feeds.txt         the feeds, their items and the publishers (model.rho)
+//   publisher-<name>.token  an http publisher's bearer token, and nothing else
+//   tmp/              one PUT's body and curl configuration, while it runs
 //   state/<id>.txt    one feed's last readings, history and publish status
 //   public/           the default directory publisher's folder
 //
@@ -34,6 +36,41 @@ fn feed_file() string {
 
 fn feed_state_file(id: string) string {
     return feed_dir() + "/state/" + id + ".txt"
+}
+
+// feed_token_path is where an http publisher's bearer token is kept: beside the
+// feed file, readable by its owner only, never in the feed file (FEED-0008).
+// @req FEED-0008
+fn feed_token_path(name: string) string {
+    return feed_dir() + "/" + fp_token_file(name)
+}
+
+// feed_token is an http publisher's token, "" when none is set.
+// @req FEED-0008
+fn feed_token(name: string) string {
+    if !fd_name_ok(name) {
+        return ""
+    }
+    return str_trim(rho_read_text(feed_token_path(name)))
+}
+
+// feed_token_save keeps an http publisher's token, written owner-only.
+// @req FEED-0008
+fn feed_token_save(name: string, token: string) bool {
+    if !fd_name_ok(name) || !fp_token_ok(token) {
+        return false
+    }
+    ignore_bool(feed_mkdir(feed_dir()))
+    return rho_write_secret(feed_token_path(name), token)
+}
+
+// feed_token_remove forgets a publisher's token: when it is removed, or is no
+// longer of kind http.
+// @req FEED-0008
+fn feed_token_remove(name: string) void {
+    if fd_name_ok(name) {
+        ignore_u32(rho_exec_args("rm", "-f\n--\n" + feed_token_path(name) + "\n", "/dev/null"))
+    }
 }
 
 fn feed_mkdir(dir: string) bool {

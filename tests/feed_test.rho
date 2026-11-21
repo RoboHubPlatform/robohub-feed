@@ -285,12 +285,80 @@ test fn a_directory_publisher_writes_only_where_it_may() void {
     check(!fp_dir_ok("/usr/share/www", home, ws), "nor anything in one")
     check(!fp_dir_ok("/srv/www\nx", home, ws), "a line break is not")
     check(!fp_dir_ok("/srv/www|x", home, ws), "a field separator is not")
-    check(fp_kind_exists("directory") && !fp_kind_exists("git") && !fp_kind_exists(""), "only directory exists")
+    check(fp_kind_exists("directory") && fp_kind_exists("http") && !fp_kind_exists("git") && !fp_kind_exists(""),
+        "directory and http exist, nothing else")
     check(fp_kind_planned("git") && fp_kind_planned("ssh") && fp_kind_planned("s3"), "the later kinds are known")
     same(fp_snapshot_path("/srv/www/", "0123456789abcdef"), "/srv/www/feeds/0123456789abcdef.json", "where a snapshot goes")
     same(fp_temp_path("/srv/www/feeds/0123456789abcdef.json", "a1b2"), "/srv/www/feeds/.0123456789abcdef.json.a1b2.tmp",
         "a file is written beside its target, hidden")
     print("[PASS] a_directory_publisher_writes_only_where_it_may\n")
+}
+
+// @verifies FEED-0008
+test fn an_http_publisher_puts_only_to_https_or_the_loopback() void {
+    check(fp_url_ok("https://morlaca.ro/feed"), "an https base URL")
+    check(fp_url_ok("https://morlaca.ro"), "with no path")
+    check(fp_url_ok("https://morlaca.ro:8443/a/b/"), "with a port and a trailing slash")
+    check(fp_url_ok("http://127.0.0.1:8080/site"), "plain http to 127.0.0.1")
+    check(fp_url_ok("http://localhost/site") && fp_url_ok("http://[::1]:9000"), "to localhost and [::1]")
+    check(!fp_url_ok("http://morlaca.ro/feed"), "plain http elsewhere is not")
+    check(!fp_url_ok("http://127.0.0.1.example.org/"), "nor to a host that only starts like the loopback")
+    check(!fp_url_ok("http://localhost.example.org"), "nor like localhost")
+    check(!fp_url_ok("http://10.0.0.5/"), "nor to the local network")
+    check(!fp_url_ok("ftp://morlaca.ro/") && !fp_url_ok("file:///srv/www") && !fp_url_ok("morlaca.ro"), "nor another scheme")
+    check(!fp_url_ok("https://"), "an https URL with no host is not")
+    check(!fp_url_ok("https://user:pw@morlaca.ro/"), "nor one with a user and password")
+    check(!fp_url_ok("http://evil.org@127.0.0.1/"), "nor one whose loopback hides behind a user")
+    check(!fp_url_ok("https://morlaca.ro/feed?x=1") && !fp_url_ok("https://morlaca.ro/#x"), "nor a query or a fragment")
+    check(!fp_url_ok("https://morlaca.ro/a b") && !fp_url_ok("https://morlaca.ro/a\nb"), "nor a space or line break")
+    check(!fp_url_ok("https://morlaca.ro/a\"b") && !fp_url_ok("https://morlaca.ro/a|b"), "nor a quote or field separator")
+    check(!fp_url_ok("https://morlaca.ro:http/") && !fp_url_ok("https://morlaca.ro:123456/"), "nor a port that is not one")
+    check(!fp_url_ok("https://morlaca.ro/a/../b") && !fp_url_ok("https://morlaca.ro//b"), "nor a .. or an empty part")
+    same(fp_http_url("https://morlaca.ro/feed/", "widget.js"), "https://morlaca.ro/feed/widget.js", "a file goes under the base URL")
+    same(fp_http_names("0123456789abcdef"), "widget.js\nexample.html\nfeeds/0123456789abcdef.json\n",
+        "the files are the directory publisher's, named as it names them, the snapshot last")
+    same(fp_content_type("feeds/0123456789abcdef.json"), "application/json", "a snapshot is JSON")
+    same(fp_content_type("widget.js"), "text/javascript; charset=utf-8", "the widget is JavaScript")
+    same(fp_content_type("example.html"), "text/html; charset=utf-8", "the example is HTML")
+    print("[PASS] an_http_publisher_puts_only_to_https_or_the_loopback\n")
+}
+
+// @verifies FEED-0008
+test fn an_http_publisher_carries_its_token_and_counts_only_2xx() void {
+    check(fp_token_ok("s3cr3t-Token_0.9~+/==") && fp_token_ok("a"), "a token68 is a token")
+    check(!fp_token_ok(""), "nothing is not")
+    check(!fp_token_ok("two words") && !fp_token_ok("a\nAuthorization: x") && !fp_token_ok("a\r"),
+        "a space or a line break, which would start another header, is not")
+    check(!fp_token_ok("a\"b") && !fp_token_ok("a\\b") && !fp_token_ok("a|b"), "nor a quote, backslash or separator")
+    check(!fp_token_ok("=abc") && !fp_token_ok("ab=c"), "padding only at the end")
+    same(fp_token_file("nest"), "publisher-nest.token", "the token file is named after the publisher")
+    same(fp_bearer("abc"), "Authorization: Bearer abc", "the header it is sent in")
+    same(fp_curl_config("https://morlaca.ro/feed/widget.js", "abc", "text/javascript; charset=utf-8"),
+        "url = \"https://morlaca.ro/feed/widget.js\"\nrequest = \"PUT\"\nheader = \"Authorization: Bearer abc\"\n" +
+        "header = \"Content-Type: text/javascript; charset=utf-8\"\nheader = \"Expect:\"\n",
+        "the address and the token go in curl's configuration file")
+    same(fp_curl_quoted("a\"b\\c"), "\"a\\\"b\\\\c\"", "a quoted value is read back exactly")
+    let args: string = fp_curl_args("/w/tmp/put-1.body", "/w/tmp/put-1.curl")
+    check(!str_contains(args, "abc") && !str_contains(args, "Bearer") && !str_contains(args, "morlaca"),
+        "neither the token nor the address is on the command line")
+    check(str_contains(args, "--max-time\n15\n") && str_contains(args, "--proto\n=https,http\n") &&
+        str_contains(args, "--data-binary\n@/w/tmp/put-1.body\n") && str_contains(args, "-K\n/w/tmp/put-1.curl\n"),
+        "the 15 s timeout, the protocols, the body and the configuration")
+    check(fp_curl_status("status=204") == 204 && fp_curl_status("status=500\n") == 500, "the status curl writes is read")
+    check(fp_curl_status("status=000curl: (7) Failed to connect") == 0 && fp_curl_status("") == 0, "no answer is 0")
+    same(fp_curl_error("status=000curl: (7) Failed to connect to 127.0.0.1 port 9\n"),
+        "curl: (7) Failed to connect to 127.0.0.1 port 9", "curl's message is kept")
+    same(fp_curl_error("curl: (28) Operation timed out\nstatus=000"), "curl: (28) Operation timed out", "on its own line too")
+    same(fp_http_failure("widget.js", 0, 200, ""), "", "200 is done")
+    same(fp_http_failure("widget.js", 0, 204, ""), "", "and 204")
+    same(fp_http_failure("feeds/a.json", 0, 500, ""), "feeds/a.json: answered HTTP 500", "500 is a failure, with its status")
+    same(fp_http_failure("widget.js", 0, 301, ""), "widget.js: answered HTTP 301", "a redirect is not followed and not done")
+    same(fp_http_failure("widget.js", 0, 401, ""), "widget.js: answered HTTP 401", "nor a refusal")
+    same(fp_http_failure("widget.js", 28, 0, "curl: (28) Operation timed out"), "widget.js: no answer within 15 s",
+        "no answer within the timeout")
+    same(fp_http_failure("widget.js", 7, 0, "curl: (7) Failed to connect"), "widget.js: no answer (curl: (7) Failed to connect)",
+        "a transport error, with curl's message")
+    print("[PASS] an_http_publisher_carries_its_token_and_counts_only_2xx\n")
 }
 
 /* -------------------------------------------------------------------------- */
@@ -325,5 +393,7 @@ fn main() void {
     a_history_is_thinned_evenly_keeping_the_last()
     small_json_answers_are_read()
     a_directory_publisher_writes_only_where_it_may()
+    an_http_publisher_puts_only_to_https_or_the_loopback()
+    an_http_publisher_carries_its_token_and_counts_only_2xx()
     feed_star_changes_and_feed_read_looks()
 }

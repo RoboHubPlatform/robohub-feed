@@ -133,3 +133,23 @@ requirements:
     owner: maintainer
     changed: 2026-11-20
     tags: [feed, ui, access]
+
+  - id: FEED-0008
+    title: An http publisher puts a refresh's files on a web site with HTTPS PUT and a token
+    statement: >
+      A publisher of kind `http` shall send each file of a refresh (the feed's
+      snapshot and `widget.js`) with an HTTPS `PUT` to its base URL followed by
+      the file's name, carrying the publisher's bearer token from an owner-only
+      file beside the feed file — never in the feed file, a page or the log;
+      shall refuse a base URL that is not `https://`, except one on the loopback;
+      shall count a publish done only when every `PUT` is answered 2xx within its
+      timeout; and shall record any other answer with its status and try again
+      on the next refresh.
+    rationale: morlaca.ro is to be a nest site on a host elsewhere; the snapshot goes out to it, and nothing at the installation is reachable from outside (robohub ADR-0019, ADR-0026, 3).
+    satisfies: [SYS-0071]
+    decided_by: [robohub:ADR-0026, robohub:ADR-0019]
+    status: approved
+    verification: test
+    owner: maintainer
+    changed: 2026-11-21
+    tags: [feed, publishers, http]

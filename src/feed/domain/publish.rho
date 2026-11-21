@@ -1,6 +1,6 @@
 //
 // @file publish.rho
-// @brief Publishers as rules: which kinds exist, which folders a directory publisher may write to, and the names of what it writes.
+// @brief Publishers as rules: which kinds exist, which folders a directory publisher may write to, which addresses an http publisher may put to, and the names of what they write.
 //
 // @module feed.domain.publish
 // @project robohub-feed
@@ -14,10 +14,11 @@ module feed.domain.publish
 
 // A publisher receives the files of one refresh — each enabled feed's snapshot
 // and widget.js — and puts each in place atomically (FEED-0006). The kinds are
-// pluggable; `directory`, a folder on this machine, is the only one that
-// exists, and a publisher of any other kind is refused until it does (robohub
-// ADR-0019 leaves where the files are hosted to later decisions, each about the
-// credential its kind needs).
+// pluggable; `directory`, a folder on this machine, and `http`, a web site that
+// takes each file with an HTTPS PUT and the publisher's bearer token (FEED-0008,
+// robohub ADR-0026, 3), exist, and a publisher of any other kind is refused
+// until it does (robohub ADR-0019 leaves where the files are hosted to later
+// decisions, each about the credential its kind needs).
 //
 // A directory publisher writes where the person says, so where that may be is a
 // rule: an absolute, plain path (no `.` or `..` part, no empty part, nothing
@@ -27,9 +28,9 @@ module feed.domain.publish
 // application's own workspace, where its default publisher writes.
 
 // fp_kind_exists is whether a publisher kind is one the application has.
-// @req FEED-0006
+// @req FEED-0006, FEED-0008
 fn fp_kind_exists(kind: string) bool {
-    return str_eq(kind, "directory")
+    return str_eq(kind, "directory") || str_eq(kind, "http")
 }
 
 // fp_kind_planned is whether a kind is one robohub ADR-0019 names for later
@@ -157,4 +158,293 @@ fn fp_last_slash(path: string) i32 {
         }
     }
     return -1
+}
+
+/* -------------------------------------------------------------------------- */
+/*  The http publisher (FEED-0008)                                            */
+/* -------------------------------------------------------------------------- */
+
+// An http publisher sends each file of a refresh with a PUT to its base URL
+// followed by the file's name — the same names, and the same set, a directory
+// publisher writes — carrying `Authorization: Bearer <token>`. The token is kept
+// in an owner-only file beside the feed file, one per publisher, and is never in
+// the feed file, a page or the log. The base URL is HTTPS; plain http only to
+// the loopback, for tests. A publish is done only when every PUT is answered
+// 2xx within FP_HTTP_TIMEOUT_S; anything else is the failure, with its status.
+
+// How long one PUT may take, connecting included, and how long the connection.
+const FP_HTTP_TIMEOUT_S: u32 = 15
+const FP_HTTP_CONNECT_S: u32 = 10
+
+// The longest base URL and token kept.
+const FP_URL_MAX: u32 = 512
+const FP_TOKEN_MAX: u32 = 4096
+
+// fp_url_ok is whether an http publisher may put to a base URL: `https://` and a
+// host, or `http://` to 127.0.0.1, localhost or [::1] alone, each with an
+// optional port and path; printable, with no user or password, query, fragment,
+// quote, backslash or field separator in it.
+// @req FEED-0008
+fn fp_url_ok(url: string) bool {
+    let n: u32 = strlen(url)
+    if n > FP_URL_MAX {
+        return false
+    }
+    var i: u32 = 0
+    while i < n {
+        let c: u8 = str_at(url, i)
+        // control, space, " # ? @ \ | and DEL
+        if c <= 32 || c == 127 || c == 34 || c == 35 || c == 63 || c == 64 || c == 92 || c == 124 {
+            return false
+        }
+        i = i + 1
+    }
+    var rest: string = ""
+    var secure: bool = false
+    if str_starts_with(url, "https://") {
+        rest = str_slice(url, 8, n - 8)
+        secure = true
+    } else if str_starts_with(url, "http://") {
+        rest = str_slice(url, 7, n - 7)
+    } else {
+        return false
+    }
+    let slash: i32 = str_index_of(rest, "/")
+    var authority: string = rest
+    if slash >= 0 {
+        authority = str_slice(rest, 0, u32(slash))
+    }
+    let host: string = fp_url_host(authority)
+    if host == "" || !fp_url_port_ok(authority, host) {
+        return false
+    }
+    if str_contains(rest, "/../") || str_contains(rest, "/./") || str_contains(rest, "//") {
+        return false
+    }
+    if secure {
+        return true
+    }
+    return fp_url_loopback(host)
+}
+
+// fp_url_host is the host of an authority (`host`, `host:port`, `[v6]` or
+// `[v6]:port`), "" when there is none.
+// @req FEED-0008
+fn fp_url_host(authority: string) string {
+    if str_starts_with(authority, "[") {
+        let close: i32 = str_index_of(authority, "]")
+        if close < 2 {
+            return ""
+        }
+        return str_slice(authority, 0, u32(close) + 1)
+    }
+    let colon: i32 = str_index_of(authority, ":")
+    if colon >= 0 {
+        return str_slice(authority, 0, u32(colon))
+    }
+    return authority
+}
+
+// fp_url_port_ok is whether what follows the host in an authority is nothing,
+// or a colon and a port of 1 to 5 digits.
+// @req FEED-0008
+fn fp_url_port_ok(authority: string, host: string) bool {
+    let after: string = str_slice(authority, strlen(host), strlen(authority) - strlen(host))
+    if after == "" {
+        return true
+    }
+    if !str_starts_with(after, ":") || strlen(after) < 2 || strlen(after) > 6 {
+        return false
+    }
+    var i: u32 = 1
+    while i < strlen(after) {
+        let c: u8 = str_at(after, i)
+        if c < 48 || c > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// fp_url_loopback is whether a host is the loopback, where plain http is
+// allowed for tests.
+// @req FEED-0008
+fn fp_url_loopback(host: string) bool {
+    return str_eq(host, "127.0.0.1") || str_eq(host, "localhost") || str_eq(host, "[::1]")
+}
+
+// fp_http_url is where one file goes: the base URL, a slash, and the file's
+// name as a directory publisher names it.
+// @req FEED-0008
+fn fp_http_url(base: string, name: string) string {
+    return fp_trim_slash(base) + "/" + name
+}
+
+// fp_http_names are the names of the files of one refresh, in the order they
+// are sent, one per line: the same set a directory publisher writes, the
+// snapshot last so a page never reads a snapshot before the widget it needs.
+// @req FEED-0008
+fn fp_http_names(id: string) string {
+    return "widget.js\nexample.html\nfeeds/" + id + ".json\n"
+}
+
+// fp_content_type is the media type a file is sent with.
+// @req FEED-0008
+fn fp_content_type(name: string) string {
+    if fp_ends_with(name, ".json") {
+        return "application/json"
+    }
+    if fp_ends_with(name, ".js") {
+        return "text/javascript; charset=utf-8"
+    }
+    if fp_ends_with(name, ".html") {
+        return "text/html; charset=utf-8"
+    }
+    return "application/octet-stream"
+}
+
+// fp_ends_with is whether a name ends with a suffix.
+// @req FEED-0008
+fn fp_ends_with(value: string, suffix: string) bool {
+    let n: u32 = strlen(value)
+    let k: u32 = strlen(suffix)
+    return n >= k && str_eq(str_slice(value, n - k, k), suffix)
+}
+
+// fp_token_ok is whether a bearer token may be kept and sent: 1 to 4096
+// characters of RFC 6750's token68 (letters, digits, - . _ ~ + /, then = at the
+// end), so it can neither end the header it is in nor start another.
+// @req FEED-0008
+fn fp_token_ok(token: string) bool {
+    let n: u32 = strlen(token)
+    if n == 0 || n > FP_TOKEN_MAX {
+        return false
+    }
+    var padding: bool = false
+    var i: u32 = 0
+    while i < n {
+        let c: u8 = str_at(token, i)
+        if c == 61 {
+            if i == 0 {
+                return false
+            }
+            padding = true
+        } else {
+            let letter: bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+            let digit: bool = c >= 48 && c <= 57
+            let mark: bool = c == 45 || c == 46 || c == 95 || c == 126 || c == 43 || c == 47
+            if padding || (!letter && !digit && !mark) {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// fp_token_file is the name of a publisher's token file, beside the feed file.
+// The name has been checked by fd_name_ok, so it cannot name anything else.
+// @req FEED-0008
+fn fp_token_file(name: string) string {
+    return "publisher-" + name + ".token"
+}
+
+// fp_bearer is the Authorization header a PUT carries.
+// @req FEED-0008
+fn fp_bearer(token: string) string {
+    return "Authorization: Bearer " + token
+}
+
+// fp_curl_quoted is a value as a quoted string of curl's configuration file,
+// read back exactly.
+// @req FEED-0008
+fn fp_curl_quoted(value: string) string {
+    return "\"" + str_replace(str_replace(value, "\\", "\\\\"), "\"", "\\\"") + "\""
+}
+
+// fp_curl_config is the configuration of one PUT, as curl reads it from a file
+// only this user can read: the address and the token never on a command line,
+// which any user of the machine can list. No `Expect: 100-continue`, and no
+// proxy for the loopback.
+// @req FEED-0008
+fn fp_curl_config(url: string, token: string, content_type: string) string {
+    return "url = " + fp_curl_quoted(url) + "\n" +
+        "request = \"PUT\"\n" +
+        "header = " + fp_curl_quoted(fp_bearer(token)) + "\n" +
+        "header = " + fp_curl_quoted("Content-Type: " + content_type) + "\n" +
+        "header = \"Expect:\"\n"
+}
+
+// fp_curl_args are curl's arguments for one PUT, one per line: only https and
+// http, no redirect followed, the time it may take, the body from a file, the
+// status written after a marker, and the rest from the configuration file.
+// @req FEED-0008
+fn fp_curl_args(body_path: string, config_path: string) string {
+    return "-sS\n--proto\n=https,http\n--max-redirs\n0\n--noproxy\n127.0.0.1,localhost,::1\n" +
+        "--connect-timeout\n" + int_to_str(FP_HTTP_CONNECT_S) + "\n--max-time\n" + int_to_str(FP_HTTP_TIMEOUT_S) + "\n" +
+        "-o\n/dev/null\n-w\nstatus=%{http_code}\n--data-binary\n@" + body_path + "\n-K\n" + config_path + "\n"
+}
+
+// fp_curl_status is the HTTP status curl wrote after its marker, 0 when it
+// wrote none or no answer came (000).
+// @req FEED-0008
+fn fp_curl_status(output: string) u32 {
+    let at: i32 = str_index_of(output, "status=")
+    if at < 0 {
+        return 0
+    }
+    let digits: string = str_slice(output, u32(at) + 7, 3)
+    if strlen(digits) != 3 {
+        return 0
+    }
+    var i: u32 = 0
+    while i < 3 {
+        let c: u8 = str_at(digits, i)
+        if c < 48 || c > 57 {
+            return 0
+        }
+        i = i + 1
+    }
+    return int_from_str(digits)
+}
+
+// fp_curl_error is curl's own message for a request that got no answer — from
+// `curl: (` to the end of its line — or "" when there is none.
+// @req FEED-0008
+fn fp_curl_error(output: string) string {
+    let at: i32 = str_index_of(output, "curl: (")
+    if at < 0 {
+        return ""
+    }
+    var message: string = str_slice(output, u32(at), strlen(output) - u32(at))
+    let end: i32 = str_index_of(message, "\n")
+    if end >= 0 {
+        message = str_slice(message, 0, u32(end))
+    }
+    let marker: i32 = str_index_of(message, "status=")
+    if marker >= 0 {
+        message = str_slice(message, 0, u32(marker))
+    }
+    return str_trim(message)
+}
+
+// fp_http_failure is why one PUT does not count as done, "" when it does: a
+// status other than 2xx, a timeout (curl's exit 28), or no answer with curl's
+// message.
+// @req FEED-0008
+fn fp_http_failure(name: string, exit: u32, status: u32, message: string) string {
+    if status >= 200 && status <= 299 && exit == 0 {
+        return ""
+    }
+    if status != 0 {
+        return name + ": answered HTTP " + int_to_str(status)
+    }
+    if exit == 28 {
+        return name + ": no answer within " + int_to_str(FP_HTTP_TIMEOUT_S) + " s"
+    }
+    if message != "" {
+        return name + ": no answer (" + message + ")"
+    }
+    return name + ": no answer (curl exit " + int_to_str(exit) + ")"
 }

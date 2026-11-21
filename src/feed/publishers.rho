@@ -19,6 +19,12 @@ module feed
 // or a sync tool serving the folder never reads half a file. A publisher of a
 // kind that does not exist yet, or a folder the rules refuse, is a failure with
 // its reason, and the next refresh tries again.
+//
+// The `http` publisher (FEED-0008) sends the same files with a PUT each to its
+// base URL followed by the file's name, through curl, with the bearer token from
+// the publisher's owner-only token file. The token reaches curl in a
+// configuration file written owner-only for that one request and removed when
+// curl is done, never on a command line; no error it records holds it.
 
 // feed_publish hands one feed's snapshot to each of its publishers and answers
 // their failures, "; "-separated, or "" when every one succeeded.
@@ -49,7 +55,7 @@ fn feed_publish(text: string, feed: string, snapshot: string) string {
 
 // feed_publish_to is one publisher's part: "" when its files are in place, or
 // why they are not.
-// @req FEED-0005, FEED-0006
+// @req FEED-0005, FEED-0006, FEED-0008
 fn feed_publish_to(publisher: string, name: string, id: string, snapshot: string) string {
     if publisher == "" {
         return "no such publisher"
@@ -57,6 +63,9 @@ fn feed_publish_to(publisher: string, name: string, id: string, snapshot: string
     let kind: string = fd_publisher_kind(publisher)
     if !fp_kind_exists(kind) {
         return "publishers of kind " + kind + " do not exist yet"
+    }
+    if str_eq(kind, "http") {
+        return feed_publish_http(fd_publisher_target(publisher), name, id, snapshot)
     }
     let folder: string = fd_publisher_target(publisher)
     if !fp_dir_ok(folder, feed_home(), feed_dir()) {
@@ -69,6 +78,69 @@ fn feed_publish_to(publisher: string, name: string, id: string, snapshot: string
     if failed == "" {
         failed = feed_put(fp_snapshot_path(folder, id), snapshot)
     }
+    return failed
+}
+
+// feed_publish_http sends each file of a refresh to an http publisher's site,
+// stopping at the first that is not answered 2xx: "" when every one was, or the
+// failure with its status (FEED-0008).
+// @req FEED-0008
+fn feed_publish_http(base: string, name: string, id: string, snapshot: string) string {
+    if !fp_url_ok(base) {
+        return "the address " + base + " is not one a publisher may put to"
+    }
+    let token: string = feed_token(name)
+    if !fp_token_ok(token) {
+        return "no token is set"
+    }
+    let names: string = fp_http_names(id)
+    var k: u32 = 0
+    while true {
+        let file: string = str_field(names, "\n", k)
+        k = k + 1
+        if file == "" {
+            break
+        }
+        var content: string = snapshot
+        if !str_starts_with(file, "feeds/") {
+            content = rho_asset("feed", "static/" + file)
+        }
+        let failed: string = feed_http_put(fp_http_url(base, file), token, file, content)
+        if failed != "" {
+            return failed
+        }
+    }
+    return ""
+}
+
+// feed_http_put sends one file with a PUT. The body and curl's configuration —
+// the address and the token — are files only this user can read, named afresh
+// in the workspace's tmp/ and removed once curl is done.
+// @req FEED-0008
+fn feed_http_put(url: string, token: string, file: string, content: string) string {
+    if content == "" {
+        return file + ": nothing to send"
+    }
+    let unique: string = rho_random_hex(8)
+    if unique == "" {
+        return "no random source"
+    }
+    let dir: string = feed_dir() + "/tmp"
+    if !feed_mkdir(dir) {
+        return "could not make " + dir
+    }
+    let body: string = dir + "/put-" + unique + ".body"
+    let config: string = dir + "/put-" + unique + ".curl"
+    let output: string = dir + "/put-" + unique + ".out"
+    var failed: string = ""
+    if !rho_write_secret(body, content) || !rho_write_secret(config, fp_curl_config(url, token, fp_content_type(file))) {
+        failed = file + ": could not prepare the request"
+    } else {
+        let exit: u32 = rho_exec_args("curl", fp_curl_args(body, config), output)
+        let answer: string = rho_read_text(output)
+        failed = fp_http_failure(file, exit, fp_curl_status(answer), fp_curl_error(answer))
+    }
+    ignore_u32(rho_exec_args("rm", "-f\n--\n" + config + "\n" + body + "\n" + output + "\n", "/dev/null"))
     return failed
 }
 

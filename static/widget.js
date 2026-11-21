@@ -105,6 +105,22 @@
       '<div class="at">' + esc(when(snapshot.updated_at)) + "</div>";
   }
 
+  // One stylesheet for every widget on the page, adopted by each shadow root;
+  // false where the browser cannot construct one.
+  var sharedSheet = null;
+  function adoptStyle(root) {
+    try {
+      if (!sharedSheet) {
+        sharedSheet = new CSSStyleSheet();
+        sharedSheet.replaceSync(STYLE);
+      }
+      root.adoptedStyleSheets = [sharedSheet];
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
   class RobohubWidget extends HTMLElement {
     static get observedAttributes() {
       return ["src", "item", "kind"];
@@ -113,6 +129,11 @@
     constructor() {
       super();
       this._root = this.attachShadow({ mode: "open" });
+      // Styled by a constructed stylesheet, which a page's Content Security
+      // Policy does not block the way it blocks a <style> element without
+      // 'unsafe-inline' (a nest site's style-src 'self'); a browser without
+      // constructed stylesheets gets the element instead (FEED-0005).
+      this._sheet = adoptStyle(this._root);
       this._timer = null;
       this._snapshot = null;
     }
@@ -191,7 +212,7 @@
           body = items.map(function (item) { return single(item, kind); }).join("");
         }
       }
-      this._root.innerHTML = "<style>" + STYLE + "</style>" + body;
+      this._root.innerHTML = (this._sheet ? "" : "<style>" + STYLE + "</style>") + body;
     }
   }
 

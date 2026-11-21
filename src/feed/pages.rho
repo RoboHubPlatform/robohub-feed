@@ -655,10 +655,23 @@ fn feed_widget(req: Request) Response {
 /*  Publishers                                                                */
 /* -------------------------------------------------------------------------- */
 
+// publisher_token_state is what the page says of an http publisher's token:
+// set or not set, never the token itself (FEED-0008).
+// @req FEED-0008
+fn publisher_token_state(req: Request, line: string) string {
+    if !str_eq(fd_publisher_kind(line), "http") {
+        return "—"
+    }
+    if fp_token_ok(feed_token(fd_publisher_name(line))) {
+        return i18n_t(req, "publisher.token_set")
+    }
+    return i18n_t(req, "publisher.token_unset")
+}
+
 // publishers_page lists the publishers and the feeds that name each, and adds
-// or changes one. Only `directory` exists; the kinds robohub ADR-0019 names for
-// later are shown, and refused (FEED-0006).
-// @req FEED-0006, FEED-0007
+// or changes one. `directory` and `http` exist; the kinds robohub ADR-0019
+// names for later are shown, and refused (FEED-0006, FEED-0008).
+// @req FEED-0006, FEED-0007, FEED-0008
 fn publishers_page(req: Request) Response {
     if !feed_may(req, false) {
         return feed_denied(req)
@@ -680,8 +693,8 @@ fn publishers_page(req: Request) Response {
                 "</button></form>"
         }
         rows = rows + "<tr><td>" + escape_html(name) + "</td><td>" + escape_html(fd_publisher_kind(line)) + "</td><td><code>" +
-            escape_html(fd_publisher_target(line)) + "</code></td><td class=\"num\">" + int_to_str(using) + "</td><td>" +
-            remove + "</td></tr>"
+            escape_html(fd_publisher_target(line)) + "</code></td><td>" + publisher_token_state(req, line) + "</td><td class=\"num\">" +
+            int_to_str(using) + "</td><td>" + remove + "</td></tr>"
     }
     var form: string = ""
     if write {
@@ -690,23 +703,28 @@ fn publishers_page(req: Request) Response {
             forms_csrf_field() +
             "<label>" + i18n_t(req, "publisher.name") + "<input name=\"name\" required maxlength=\"32\" pattern=\"[a-z][a-z0-9-]*\"></label>" +
             "<label>" + i18n_t(req, "publisher.kind") + "<select name=\"kind\"><option value=\"directory\">directory</option>" +
+            "<option value=\"http\">http</option>" +
             "<option value=\"git\" disabled>git — " + i18n_t(req, "publisher.later") + "</option>" +
             "<option value=\"ssh\" disabled>ssh — " + i18n_t(req, "publisher.later") + "</option>" +
             "<option value=\"s3\" disabled>s3 — " + i18n_t(req, "publisher.later") + "</option></select></label>" +
-            "<label>" + i18n_t(req, "publisher.folder") + "<input name=\"target\" required maxlength=\"512\" placeholder=\"/srv/www/robohub\"></label>" +
+            "<label>" + i18n_t(req, "publisher.target") + "<input name=\"target\" required maxlength=\"512\" placeholder=\"/srv/www/robohub · https://example.org/feed\"></label>" +
+            "<label>" + i18n_t(req, "publisher.token") + "<input type=\"password\" name=\"token\" maxlength=\"4096\" autocomplete=\"new-password\">" +
+            "<small>" + i18n_t(req, "publisher.token_hint") + "</small></label>" +
             "<div class=\"app-actions\"><button type=\"submit\">" + i18n_t(req, "publisher.save") + "</button></div></form></section>"
     }
     return feed_page(req, status_ok(), i18n_t(req, "nav.publishers"),
         "<div class=\"ph\"><h1>" + i18n_t(req, "nav.publishers") + "</h1><p>" + i18n_t(req, "publisher.lede") + "</p></div>" +
         "<section class=\"rh-card wide\"><table><thead><tr><th>" + i18n_t(req, "publisher.name") + "</th><th>" +
-        i18n_t(req, "publisher.kind") + "</th><th>" + i18n_t(req, "publisher.folder") + "</th><th>" +
-        i18n_t(req, "publisher.feeds") + "</th><th></th></tr></thead><tbody>" + rows + "</tbody></table></section>" + form)
+        i18n_t(req, "publisher.kind") + "</th><th>" + i18n_t(req, "publisher.target") + "</th><th>" +
+        i18n_t(req, "publisher.token") + "</th><th>" + i18n_t(req, "publisher.feeds") + "</th><th></th></tr></thead><tbody>" + rows + "</tbody></table></section>" + form)
 }
 
 // publisher_save adds a publisher, or changes the one of that name. A kind that
 // does not exist yet is refused (FEED-0006), and so is a folder the rules do
-// not allow.
-// @req FEED-0006, FEED-0007
+// not allow. An http publisher needs an address the rules allow and a token: a
+// token typed in is written to the publisher's owner-only token file, never the
+// feed file, and an empty field keeps the one set (FEED-0008).
+// @req FEED-0006, FEED-0007, FEED-0008
 fn publisher_save(req: Request) Response {
     let refused: string = feed_change_refusal(req)
     if refused != "" {
@@ -725,11 +743,32 @@ fn publisher_save(req: Request) Response {
     if !fp_kind_exists(kind) {
         return feed_back("/publishers", "error", "publisher.error.kind")
     }
-    if !fp_dir_ok(target, feed_home(), feed_dir()) {
+    let http: bool = str_eq(kind, "http")
+    let token: string = form_field(body, "token")
+    if http {
+        if !fp_url_ok(target) {
+            return feed_back("/publishers", "error", "publisher.error.url")
+        }
+        if token != "" && !fp_token_ok(token) {
+            return feed_back("/publishers", "error", "publisher.error.token")
+        }
+        if token == "" && !fp_token_ok(feed_token(name)) {
+            return feed_back("/publishers", "error", "publisher.error.token")
+        }
+    } else if !fp_dir_ok(target, feed_home(), feed_dir()) {
         return feed_back("/publishers", "error", "publisher.error.folder")
     }
     rho_lock("feed-file")
-    let saved: bool = feed_save(fd_replace_publisher(feed_text(), name, fd_publisher_make(name, kind, target)))
+    var saved: bool = true
+    if http && token != "" {
+        saved = feed_token_save(name, token)
+    }
+    if saved {
+        saved = feed_save(fd_replace_publisher(feed_text(), name, fd_publisher_make(name, kind, target)))
+    }
+    if saved && !http {
+        feed_token_remove(name)
+    }
     rho_unlock("feed-file")
     if !saved {
         return feed_back("/publishers", "error", "feed.error.save")
@@ -737,8 +776,8 @@ fn publisher_save(req: Request) Response {
     return feed_back("/publishers", "done", "publisher.saved")
 }
 
-// publisher_delete removes a publisher no feed names.
-// @req FEED-0007
+// publisher_delete removes a publisher no feed names, and its token.
+// @req FEED-0007, FEED-0008
 fn publisher_delete(req: Request) Response {
     let refused: string = feed_change_refusal(req)
     if refused != "" {
@@ -756,6 +795,9 @@ fn publisher_delete(req: Request) Response {
         return feed_back("/publishers", "error", "publisher.error.in_use")
     }
     let saved: bool = feed_save(fd_replace_publisher(text, name, ""))
+    if saved {
+        feed_token_remove(name)
+    }
     rho_unlock("feed-file")
     if !saved {
         return feed_back("/publishers", "error", "feed.error.save")

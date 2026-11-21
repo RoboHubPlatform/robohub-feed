@@ -8,9 +8,9 @@
 name: feed
 suites:
   # Ids, intervals, the file of feeds, the read-only scopes, staleness, UTC
-  # times, values, the snapshot exactly, the privacy check, publisher folders
-  # and grants.
-  # @verifies FEED-0001, FEED-0002, FEED-0003, FEED-0004, FEED-0006, FEED-0007
+  # times, values, the snapshot exactly, the privacy check, publisher folders,
+  # the http publisher's addresses, file names, token and answers, and grants.
+  # @verifies FEED-0001, FEED-0002, FEED-0003, FEED-0004, FEED-0006, FEED-0007, FEED-0008
   - name: tests/feed_test.rho
     kind: rho
     tags: [unit, rho, domain]
@@ -26,6 +26,17 @@ suites:
     kind: command
     tags: [smoke, security]
     command: [python3, tests/feed_smoke.py]
+  # The http publisher end to end beside a receiver on 127.0.0.1: addresses
+  # and tokens refused, the token kept owner-only beside the feed file and shown
+  # only as set, every file of a publish PUT under the base URL with the bearer
+  # token, an answer of 500 recorded with its status and tried again by the
+  # next refresh, a site that does not answer, and the token in no other file
+  # and not in the log.
+  # @verifies FEED-0008
+  - name: http-publisher-smoke
+    kind: command
+    tags: [smoke, security]
+    command: [python3, tests/http_publisher_smoke.py]
   # widget.js under node with a stand-in DOM: the fetch without credentials, the
   # refresh at the snapshot's interval, number, chart and table, stale marking,
   # the colour scheme, and nothing stored or loaded besides the snapshot.

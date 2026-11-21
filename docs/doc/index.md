@@ -162,9 +162,28 @@ server, a sync tool, or testing. Feed starts with one, `local`, writing into
 `public/` in its workspace. A directory publisher writes only to an absolute,
 plain path: not the root, a system folder, the home folder itself, or anything
 under a hidden folder (which keeps `~/.rho`, `~/.ssh` and `~/.config` out of
-reach), except inside Feed's workspace. Publishers of other kinds — git (GitHub
-Pages), ssh/rsync, S3 — are refused until they exist; each will be a decision of
-its own about the credential it needs.
+reach), except inside Feed's workspace.
+
+The second kind is **`http`**, a web site elsewhere — a nest site's `nest-feed`
+module, for one (robohub ADR-0026). It sends the same files, named the same way,
+each with an HTTPS `PUT` to its base URL followed by the file's name
+(`<base>/widget.js`, `<base>/example.html`, `<base>/feeds/<id>.json`, the
+snapshot last), carrying `Authorization: Bearer <token>`. The base URL must be
+`https://`; plain `http://` is accepted only to `127.0.0.1`, `localhost` or
+`[::1]`, for tests, and a URL with a user, a query or a fragment is refused. A
+publish counts as done only when every `PUT` is answered 2xx within **15 s**
+(redirects are not followed); any other answer stops it and is recorded with its
+HTTP status, or as no answer with the transport's error, and the next refresh
+tries again.
+
+The token is typed into the publisher's form and kept in
+`publisher-<name>.token` beside the feed file, readable by its owner only. It is
+never in `feeds.txt`, never shown again (the Publishers page says only *set* or
+*not set*; leaving the field empty keeps it), never on a command line and never
+in the log or an error. Removing the publisher removes its token.
+
+Publishers of other kinds — git (GitHub Pages), ssh/rsync, S3 — are refused until
+they exist; each will be a decision of its own about the credential it needs.
 
 In a publisher's folder:
 
@@ -175,7 +194,8 @@ feeds/<id>.json       one per feed that names the publisher
 ```
 
 Deleting a feed removes its snapshot from its directory publishers; taking a
-publisher off a feed removes the feed's snapshot from that publisher.
+publisher off a feed removes the feed's snapshot from that publisher. An http
+publisher's site keeps what it was sent; Feed sends it nothing but `PUT`s.
 `example.html` names no feed, so it cannot lead from one feed to another.
 
 ## Access
@@ -194,6 +214,8 @@ In its workspace:
 |---|---|
 | `feeds.txt` | the feeds, their items and the publishers, one record per line |
 | `state/<id>.txt` | a feed's last readings, history and publish status |
+| `publisher-<name>.token` | an http publisher's bearer token, owner-only |
+| `tmp/` | one `PUT`'s body and curl configuration, removed when it is done |
 | `public/` | the `local` publisher's folder |
 | `data/app.db` | the notifications a page shows as toasts |
 

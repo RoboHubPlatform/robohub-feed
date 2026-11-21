@@ -16,7 +16,7 @@ module:
   name: feed
   id: robohub.app.feed
   type: rho
-  version: 0.1.0
+  version: 0.2.0
   kind: keeper-hosted
   title: Feed
   description: >
@@ -75,6 +75,16 @@ deps:
     notifications: ">=0.3.0"
     logging: ">=0.2.0"
     robohub-auth: ">=0.1.0"
+
+# What it needs from the machine: curl, which an http publisher sends each file
+# with (FEED-0008).
+system_deps:
+  executables:
+    - name: curl
+      description: an http publisher sends each file with it
+      install:
+        apt: curl
+        brew: curl
 
 deploy:
   port: 8484

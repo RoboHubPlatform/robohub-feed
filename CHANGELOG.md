@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.2.0] - 2026-11-21
+
+An `http` publisher (FEED-0008, robohub ADR-0026, 3), so a feed's files reach a
+site elsewhere — a nest site's `nest-feed` module — while nothing at the
+installation is reachable from outside.
+
+- **`http` publishers** send each file of a refresh — `widget.js`,
+  `example.html` and `feeds/<id>.json`, the set and names a directory publisher
+  writes — with a `PUT` to the publisher's base URL followed by the file's name,
+  carrying `Authorization: Bearer <token>`. The base URL is `https://`; plain
+  `http://` only to the loopback, for tests; a user, query or fragment is
+  refused.
+- **The token** is set on the publisher's form and kept in
+  `publisher-<name>.token` beside the feed file, owner-only: never in
+  `feeds.txt`, never shown again (the page says *set* or *not set*), never on a
+  command line, in an error or in the log; it reaches curl through a
+  configuration file written owner-only for one request and removed after it.
+  Removing the publisher removes its token.
+- **Done means 2xx**: a publish counts only when every `PUT` is answered 2xx
+  within 15 s (10 s to connect, no redirect followed); any other answer is
+  recorded with its HTTP status, or as no answer with curl's error, and the next
+  refresh tries again.
+- The Publishers page offers kind `http`, a base URL and a token, and shows
+  whether each http publisher has its token.
+- `tests/http_publisher_smoke.py` runs Feed beside a receiver on 127.0.0.1.
+- `widget.js` styles itself with a constructed stylesheet adopted by its shadow root, not a `<style>` element. A page whose Content Security Policy has no `unsafe-inline` for styles, such as a nest site's `style-src 'self'`, blocks that element and drew the widget unstyled. A browser without constructed stylesheets still gets the element.
+
 ## [0.1.0] - 2026-11-20
 
 The first version of Feed (robohub ADR-0019, SYS-0071; FEED-0001..0007): chosen

@@ -9,9 +9,10 @@ A **feed** is an explicit selection of readings, each with a label and a unit.
 On every refresh Feed reads each item from the application that holds it, with a
 read-only service token, builds one snapshot per feed — labels, values, units and
 times, nothing that names the installation — and hands it with `widget.js` to the
-feed's **publishers**. The first publisher kind is `directory`, a folder on this
-machine that a web server or a sync tool serves. Other sites read only those
-files; a reading that stops arriving is shown as stale.
+feed's **publishers**: `directory`, a folder on this machine that a web server or
+a sync tool serves, or `http`, a site elsewhere that takes each file with an
+HTTPS `PUT` and the publisher's bearer token. Other sites read only those files;
+a reading that stops arriving is shown as stale.
 
 This repository sits beside the orchestrator, `robohub`, which carries the shared
 modules it uses (`ui`, `i18n`, `forms`, `notifications`, `settings`, `logging`)
@@ -68,9 +69,11 @@ rho test .
 ```
 
 The Rho unit tests hold the rules (ids, intervals, staleness, the snapshot, the
-privacy check, publisher folders, grants); `tests/feed_smoke.py` runs the built
-application beside stand-ins for Mesh, an appapi application and the token
-issuer and checks every snapshot it writes against the schema; and
+privacy check, publisher folders, the http publisher's addresses and tokens,
+grants); `tests/feed_smoke.py` runs the built application beside stand-ins for
+Mesh, an appapi application and the token issuer and checks every snapshot it
+writes against the schema; `tests/http_publisher_smoke.py` runs it beside a
+local receiver for the http publisher; and
 `tests/widget_test.py` runs `widget.js` under node with a stand-in DOM.
 
 ## Documentation
